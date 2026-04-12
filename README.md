@@ -1,50 +1,41 @@
 # DeepSeek2API
 
-`DeepSeek2API` 是一个纯 Node.js 的本地控制台，用于统一管理：
-
-- DeepSeek Web 账号绑定与轮换
-- 本地用户注册 / 登录
-- 邀请码与注册开关
-- 无痕模式
-- OpenAI 兼容接口
-- 受控 DeepSeek 代理接口
-
-项目不依赖第三方 npm 包，下载后即可直接运行。
-默认发布内容不包含测试数据、示例账号、预置管理员凭据或任何个人运行数据。
+> 一个纯 Node.js 的 DeepSeek Web 控制台 + OpenAI 兼容桥接服务。  
+> 把本地用户体系、DeepSeek 账号绑定、API Key 管理、原生代理调试和管理后台放进同一个可直接运行的项目里。
 
 ## 功能概览
 
-### 控制台
+| 模块 | 能力 |
+| --- | --- |
+| 控制台 UI | 登录 / 注册、聊天工作区、历史会话、文件上传、主题切换、流式 / 非流式响应切换 |
+| DeepSeek 账号层 | 绑定多个 DeepSeek Web 账号，按管理员 / 本地用户隔离可见范围 |
+| OpenAI 兼容层 | 提供 `GET /v1/models` 和 `POST /v1/chat/completions` |
+| 原生代理层 | 提供 `/proxy/*` 白名单转发，便于调试和复用 DeepSeek Web 接口 |
+| 管理后台 | 注册开关、邀请码生成 / 删除、用户启用 / 禁用 / 删除、并发 / 速率限制 |
+| 无痕模式 | 支持全局或用户级无痕，会话完成后自动清理 |
+| 部署形态 | 无第三方 npm 运行时依赖，`npm start` 即可启动 |
 
-- 登录 / 注册双入口
-- DeepSeek 账号绑定
-- 聊天会话列表与历史消息查看
-- 文件上传
-- 流式 / 非流式响应切换
-- 主题切换
+## 项目特点
 
-### 管理能力
-
-- 管理员登录
-- 注册开关
-- 邀请码生成、删除、批量删除
-- 本地用户禁用、启用、删除
-- 用户级并发 / 每分钟请求限制
-
-### API 能力
-
-- DeepSeek 代理：`/proxy/*`
-- OpenAI 兼容：`/v1/models`、`/v1/chat/completions`
-- API Key 管理
-- 多账号轮询
-- 无痕模式下自动清理会话
+- 纯 Node.js 原生 HTTP 服务，无 Express、无数据库、无构建步骤
+- 前后端都在一个仓库里，静态资源由服务端直接托管
+- 运行状态统一保存在 `data/app.json`
+- DeepSeek token 失效时会自动重新登录并刷新
+- 遇到 PoW 保护接口时会自动获取 wasm 并求解挑战
+- OpenAI 兼容层同时支持流式和非流式响应
+- `deepseek-reasoner-*` 模型会把思维内容包裹在 `<think>...</think>`
+- API Key 请求会在当前用户可见账号之间轮询，提高多账号利用率
 
 ## 运行要求
 
 - Node.js 18+
-- 服务端可以访问 `https://chat.deepseek.com`
+- 服务端能够访问 `https://chat.deepseek.com`
+- 浏览器在绑定 DeepSeek 账号时需要访问 `https://cdn.deepseek.com`
+- 如触发 PoW 校验，服务端还需要访问 `https://fe-static.deepseek.com`
 
-## 启动
+## 快速开始
+
+### 1) 启动服务
 
 ```bash
 npm start
@@ -56,49 +47,113 @@ npm start
 http://127.0.0.1:3000
 ```
 
-## 环境变量
+### 2) 可选：创建本地配置
 
-可选环境变量如下：
+仓库不自带 `.env`。如需启用管理员入口或修改端口，可参考 `.env.example` 手动创建：
+
+```bash
+cp .env.example .env
+```
+
+Windows PowerShell 可以使用：
+
+```powershell
+Copy-Item .env.example .env
+```
+
+`.env.example` 内容：
+
+```env
+PORT=3000
+APP_ADMIN_USERNAME=
+APP_ADMIN_PASSWORD=
+```
+
+### 3) 打开控制台
+
+浏览器访问 `http://127.0.0.1:3000`，然后按下面的典型流程使用：
+
+1. 注册本地用户，或使用管理员账号登录
+2. 在“账号”页绑定 DeepSeek 账号
+3. 在“密钥”页创建 API Key
+4. 使用内置聊天工作区，或通过 OpenAI 兼容接口接入你的客户端
+
+## 环境变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `PORT` | `3000` | 服务端口 |
+| `PORT` | `3000` | 服务监听端口 |
 | `APP_ADMIN_USERNAME` | 空 | 管理员用户名 |
 | `APP_ADMIN_PASSWORD` | 空 | 管理员密码 |
 
-只有同时设置 `APP_ADMIN_USERNAME` 和 `APP_ADMIN_PASSWORD`，管理入口才会启用。
+只有同时设置 `APP_ADMIN_USERNAME` 和 `APP_ADMIN_PASSWORD` 时，管理员入口才会启用。
 
-发布包不包含 `.env`。如需本地落盘配置，可参考根目录的 `.env.example` 手动创建 `.env`。
+## 控制台能力
 
-## 数据目录
+### 聊天工作区
 
-运行态数据写入 `data/app.json`。
+- 查看 DeepSeek 历史会话并加载消息记录
+- 新建会话、继续会话、发送消息
+- 上传文件并在聊天中引用
+- 切换流式 / 非流式响应
+- 切换快速 / 专家 / 推理 / 联网模型
 
-服务首次读写数据时会自动创建该文件，基础结构包括：
+### 账号与密钥
 
-- `accounts`
-- `apiKeys`
-- `incognito`
-- `invites`
-- `registration`
-- `sessions`
-- `users`
+- 绑定 / 删除 DeepSeek Web 账号
+- 为当前用户创建多个 API Key
+- API Key 可指定自定义明文，留空则自动生成
+- OpenAI 兼容调用默认使用所选账号起始，并在当前用户可见账号之间轮询
 
-发布源码或打包交付时，不要携带真实运行数据。
+### 管理后台
 
-推荐发布基线：
+- 管理本地注册开关
+- 控制是否必须使用邀请码注册
+- 生成、删除、批量删除邀请码
+- 禁用、启用、删除本地用户
+- 为用户设置并发上限和每分钟请求上限
 
-- 保留 `data/.gitkeep`
-- 不保留真实 `data/app.json`
-- 不保留运行日志、历史压缩包和旧发布副本
-- 不保留本机私有 `.env`
-- 不保留任何账号、密码、Token、API Key、邀请码、会话和用户数据
+### 无痕模式
 
-注意：当前实现会在首次读取注册配置时创建 `data/app.json`，因此即使只访问一次 `/api/me` 或 `/api/discovery`，打包前也要再次确认 `data/` 目录只剩 `data/.gitkeep`。
+- 管理员可以开启全局无痕
+- 普通用户可以只为自己开启无痕
+- 开启后，聊天完成后会自动清理相关 DeepSeek 会话
 
-## OpenAI 兼容模型
+## OpenAI 兼容接口
 
-支持以下模型 ID：
+### 支持的接口
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+
+### 请求示例
+
+```bash
+curl http://127.0.0.1:3000/v1/models \
+  -H "Authorization: Bearer <YOUR_API_KEY>"
+```
+
+```bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H "Authorization: Bearer <YOUR_API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat-fast",
+    "messages": [
+      { "role": "user", "content": "hello" }
+    ],
+    "stream": false
+  }'
+```
+
+### 模型说明
+
+- 默认模型：`deepseek-chat-fast`
+- 联网能力通过模型后缀 `-search` 控制
+- 不支持 `web_search_options`；请改用 `*-search` 模型
+
+<details>
+<summary>展开查看支持的模型 ID</summary>
 
 - `deepseek-chat-fast`
 - `deepseek-chat-fast-search`
@@ -109,13 +164,60 @@ http://127.0.0.1:3000
 - `deepseek-reasoner-expert`
 - `deepseek-reasoner-expert-search`
 
-说明：
+</details>
 
-- `*-search` 表示联网版本
-- 推理模型会把思维过程包装在 `<think>...</think>`
-- 搜索能力通过模型后缀控制，不使用 `web_search_options`
+## 原生代理接口
 
-## 主要接口
+### 支持的接口
+
+- `GET /proxy/...`
+- `POST /proxy/...`
+
+### 使用说明
+
+- `/proxy/*` 走的是登录态会话，不是 API Key 鉴权
+- 如果存在多个可用账号，可通过请求头 `x-proxy-account-id` 指定账号
+- 只允许转发白名单路径，白名单定义在 `src/config.js`
+
+<details>
+<summary>展开查看当前白名单路径</summary>
+
+- `/api/v0/chat/completion`
+- `/api/v0/chat/continue`
+- `/api/v0/chat/create_pow_challenge`
+- `/api/v0/chat/edit_message`
+- `/api/v0/chat/history_messages`
+- `/api/v0/chat/message_feedback`
+- `/api/v0/chat/regenerate`
+- `/api/v0/chat/resume_stream`
+- `/api/v0/chat/stop_stream`
+- `/api/v0/chat_session/create`
+- `/api/v0/chat_session/delete`
+- `/api/v0/chat_session/delete_all`
+- `/api/v0/chat_session/fetch_page`
+- `/api/v0/chat_session/update_pinned`
+- `/api/v0/chat_session/update_title`
+- `/api/v0/client/settings`
+- `/api/v0/download_export_history`
+- `/api/v0/export_all`
+- `/api/v0/file/fetch_files`
+- `/api/v0/file/preview`
+- `/api/v0/file/upload_file`
+- `/api/v0/share/content`
+- `/api/v0/share/create`
+- `/api/v0/share/delete`
+- `/api/v0/share/fork`
+- `/api/v0/share/list`
+- `/api/v0/users`
+- `/api/v0/users/settings`
+- `/api/v0/users/update_settings`
+
+</details>
+
+## 本地接口总览
+
+<details>
+<summary>展开查看完整接口清单</summary>
 
 ### 公共接口
 
@@ -146,40 +248,49 @@ http://127.0.0.1:3000
 - `POST /api/admin/users/batch-disable`
 - `POST /api/admin/users/batch-delete`
 
-### DeepSeek 代理
+</details>
 
-- `GET /proxy/...`
-- `POST /proxy/...`
+## 数据存储与发布建议
 
-允许转发的上游路径定义在 `src/config.js` 的 `allowedProxyPaths`。
+运行时数据会写入 `data/app.json`。如果文件不存在，服务会在首次读写状态时自动创建。
 
-### OpenAI 兼容接口
+建议提交 / 发布时遵循下面的基线：
 
-- `GET /v1/models`
-- `POST /v1/chat/completions`
+- 保留 `data/.gitkeep`
+- 不提交真实的 `data/app.json`
+- 不提交 `.env`
+- 不提交日志、历史压缩包、旧发布副本
+- 不提交任何真实账号、密码、token、API Key、邀请码、会话和用户数据
 
-请求示例：
+当前仓库的 `.gitignore` 已忽略以下常见运行产物：
 
-```json
-{
-  "model": "deepseek-chat-fast",
-  "messages": [
-    { "role": "user", "content": "hello" }
-  ],
-  "stream": true
-}
-```
+- `data/app.json`
+- `data/*.log`
+- `.env`
+- `release/`
 
-## 目录结构
+## 项目结构
 
 ```text
 .
-|-- .env.example
-|-- .gitignore
-|-- README.md
-|-- package.json
-|-- data/
-|   `-- .gitkeep
-|-- public/
-`-- src/
+├─ data/                  # 运行时数据目录
+├─ public/                # 前端控制台静态资源
+├─ src/
+│  ├─ routes/             # 公共 / 私有 / 管理 / 代理路由
+│  ├─ services/           # 账号、用户、桥接、PoW、限流等核心逻辑
+│  ├─ storage/            # JSON 文件存储
+│  └─ utils/              # HTTP、SSE、ID、Prompt 等工具
+├─ .env.example
+├─ package.json
+└─ README.md
 ```
+
+## 当前实现边界
+
+- 当前实现使用单个 JSON 文件持久化状态，更适合单机或小规模内部部署
+- 没有引入数据库、消息队列或多实例锁，不适合直接按多副本方式横向扩展
+- 当前仓库未包含测试、构建流水线或正式发布脚本，默认定位是一个可直接运行的最小实现
+
+## License
+
+当前仓库未附带 `LICENSE` 文件。如果你准备公开分发，建议先补充许可证声明。

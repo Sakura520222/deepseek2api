@@ -250,25 +250,6 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 </details>
 
-## 数据存储与发布建议
-
-运行时数据会写入 `data/app.json`。如果文件不存在，服务会在首次读写状态时自动创建。
-
-建议提交 / 发布时遵循下面的基线：
-
-- 保留 `data/.gitkeep`
-- 不提交真实的 `data/app.json`
-- 不提交 `.env`
-- 不提交日志、历史压缩包、旧发布副本
-- 不提交任何真实账号、密码、token、API Key、邀请码、会话和用户数据
-
-当前仓库的 `.gitignore` 已忽略以下常见运行产物：
-
-- `data/app.json`
-- `data/*.log`
-- `.env`
-- `release/`
-
 ## 项目结构
 
 ```text
@@ -285,12 +266,6 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 └─ README.md
 ```
 
-## 当前实现边界
-
-- 当前实现使用单个 JSON 文件持久化状态，更适合单机或小规模内部部署
-- 没有引入数据库、消息队列或多实例锁，不适合直接按多副本方式横向扩展
-- 当前仓库未包含测试、构建流水线或正式发布脚本，默认定位是一个可直接运行的最小实现
-
 ## License
 
-当前仓库未附带 `LICENSE` 文件。如果你准备公开分发，建议先补充许可证声明。
+This project is licensed under the [MIT License](./LICENSE).

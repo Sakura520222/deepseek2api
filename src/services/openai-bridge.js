@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { createDeepseekDeltaDecoder, createSseParser } from "../utils/deepseek-sse.js";
 import { buildPromptFromMessages } from "../utils/prompt.js";
+import { buildToolSystemPrompt, extractToolCalls } from "../utils/tool-prompt.js";
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
@@ -24,19 +25,59 @@ function toContentText(content) {
     .join("\n");
 }
 
+function normalizeToolCall(toolCall) {
+  const args = typeof toolCall.function.arguments === "string"
+    ? toolCall.function.arguments
+    : JSON.stringify(toolCall.function.arguments);
+  return `<tool_call={"name": "${toolCall.function.name}", "arguments": ${args}}`;
+}
+
 function normalizeMessages(messages) {
-  return (messages ?? []).map((message) => ({
-    role: message.role ?? "user",
-    content: toContentText(message.content)
-  }));
+  return (messages ?? []).flatMap((message) => {
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const content = message.content ?? "";
+      const calls = message.tool_calls.map(normalizeToolCall).join("\n");
+      return [{ role: "assistant", content: content ? `${content}\n${calls}` : calls }];
+    }
+    if (message.role === "tool") {
+      const resultText = toContentText(message.content);
+      const callId = message.tool_call_id ? ` (call ${message.tool_call_id})` : "";
+      return [{ role: "tool", content: `TOOL_RESULT${callId}: ${resultText}` }];
+    }
+    return [{ role: message.role ?? "user", content: toContentText(message.content) }];
+  });
+}
+
+function filterToolCalls(toolCalls, tools) {
+  if (!toolCalls || !tools) return null;
+
+  const validNames = tools.map((t) => t.function?.name).filter(Boolean);
+
+  const filtered = toolCalls.map((tc) => {
+    if (validNames.includes(tc.function.name)) return tc;
+
+    const match = validNames.find((name) => name.endsWith("__" + tc.function.name) || name.endsWith("." + tc.function.name));
+    if (match) return { ...tc, function: { ...tc.function, name: match } };
+
+    return null;
+  }).filter(Boolean);
+
+  return filtered.length > 0 ? filtered : null;
 }
 
 function resolveCompletionRequest(body) {
   assertNoLegacySearchOptions(body);
 
+  const tools = body?.tools;
+  const toolChoice = body?.tool_choice;
+  const toolPrompt = (tools?.length && toolChoice !== "none")
+    ? buildToolSystemPrompt(tools, toolChoice)
+    : null;
+
   return {
     model: resolveOpenAiModel(body?.model),
-    prompt: buildPromptFromMessages(normalizeMessages(body?.messages))
+    prompt: buildPromptFromMessages(normalizeMessages(body?.messages), toolPrompt),
+    tools: tools || null
   };
 }
 
@@ -161,6 +202,28 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
         content += text;
       });
 
+      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(content), requestOptions.tools) : null;
+
+      if (toolCalls) {
+        return {
+          id: `chatcmpl_${randomUUID()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: requestOptions.model.id,
+          choices: [
+            {
+              index: 0,
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: toolCalls
+              }
+            }
+          ]
+        };
+      }
+
       return {
         id: `chatcmpl_${randomUUID()}`,
         object: "chat.completion",
@@ -179,6 +242,27 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
       };
     }
   });
+}
+
+function buildToolCallChunkPayload(completionId, model, toolCalls, finishReason) {
+  const toolCallDeltas = toolCalls.map((tc, index) => ({
+    index,
+    id: tc.id,
+    type: "function",
+    function: { name: tc.function.name, arguments: tc.function.arguments }
+  }));
+
+  const choice = finishReason
+    ? { index: 0, delta: {}, finish_reason: finishReason }
+    : { index: 0, delta: { tool_calls: toolCallDeltas } };
+
+  return {
+    id: completionId,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [choice]
+  };
 }
 
 export async function streamOpenAiResponse(options) {
@@ -213,19 +297,98 @@ export async function streamOpenAiResponse(options) {
         ))}\n\n`
       );
 
-      await consumeTaggedStream(deepseekResponse.body, (delta) => {
-        response.write(
-          `data: ${JSON.stringify(buildChunkPayload(
-            completionId,
-            requestOptions.model.id,
-            { content: delta }
-          ))}\n\n`
-        );
-      });
+      if (requestOptions.tools) {
+        const MARKER = "<tool_call";
+        let toolCallDetected = false;
+        let toolCallBuffer = "";
+        let textBuffer = "";
 
-      response.write(
-        `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
-      );
+        await consumeTaggedStream(deepseekResponse.body, (text) => {
+          if (toolCallDetected) {
+            toolCallBuffer += text;
+            return;
+          }
+
+          textBuffer += text;
+
+          const markerIndex = textBuffer.indexOf(MARKER);
+          if (markerIndex !== -1) {
+            toolCallDetected = true;
+            const before = textBuffer.slice(0, markerIndex);
+            if (before) {
+              response.write(
+                `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
+              );
+            }
+            toolCallBuffer = textBuffer.slice(markerIndex);
+            textBuffer = "";
+            return;
+          }
+
+          let safeEnd = textBuffer.length;
+          for (let i = Math.max(0, textBuffer.length - MARKER.length); i < textBuffer.length; i++) {
+            if (textBuffer[i] !== "<") continue;
+            const tail = textBuffer.slice(i);
+            if (MARKER.startsWith(tail)) {
+              safeEnd = i;
+              break;
+            }
+          }
+
+          const toStream = textBuffer.slice(0, safeEnd);
+          textBuffer = textBuffer.slice(safeEnd);
+
+          if (toStream) {
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toStream }))}\n\n`
+            );
+          }
+        });
+
+        if (textBuffer && !toolCallDetected) {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: textBuffer }))}\n\n`
+          );
+        }
+
+        if (toolCallDetected) {
+          const toolCalls = filterToolCalls(extractToolCalls(toolCallBuffer), requestOptions.tools);
+          if (toolCalls) {
+            response.write(
+              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
+            );
+            response.write(
+              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
+            );
+          } else {
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toolCallBuffer }))}\n\n`
+            );
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+            );
+          }
+        } else {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+          );
+        }
+      } else {
+        await consumeTaggedStream(deepseekResponse.body, (delta) => {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(
+              completionId,
+              requestOptions.model.id,
+              { content: delta }
+            ))}\n\n`
+          );
+        });
+
+        response.write(
+          `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+        );
+      }
+
       response.end("data: [DONE]\n\n");
     }
   });

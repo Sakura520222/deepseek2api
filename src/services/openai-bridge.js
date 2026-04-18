@@ -298,29 +298,77 @@ export async function streamOpenAiResponse(options) {
       );
 
       if (requestOptions.tools) {
-        let fullContent = "";
-        await consumeTaggedStream(deepseekResponse.body, (text) => {
-          fullContent += text;
-        });
+        const MARKER = "<tool_call";
+        let toolCallDetected = false;
+        let toolCallBuffer = "";
+        let textBuffer = "";
 
-        const toolCalls = filterToolCalls(extractToolCalls(fullContent), requestOptions.tools);
-        if (toolCalls) {
-          response.write(
-            `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
-          );
-          response.write(
-            `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
-          );
-        } else {
-          if (fullContent) {
+        await consumeTaggedStream(deepseekResponse.body, (text) => {
+          if (toolCallDetected) {
+            toolCallBuffer += text;
+            return;
+          }
+
+          textBuffer += text;
+
+          const markerIndex = textBuffer.indexOf(MARKER);
+          if (markerIndex !== -1) {
+            toolCallDetected = true;
+            const before = textBuffer.slice(0, markerIndex);
+            if (before) {
+              response.write(
+                `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
+              );
+            }
+            toolCallBuffer = textBuffer.slice(markerIndex);
+            textBuffer = "";
+            return;
+          }
+
+          let safeEnd = textBuffer.length;
+          for (let i = Math.max(0, textBuffer.length - MARKER.length); i < textBuffer.length; i++) {
+            if (textBuffer[i] !== "<") continue;
+            const tail = textBuffer.slice(i);
+            if (MARKER.startsWith(tail)) {
+              safeEnd = i;
+              break;
+            }
+          }
+
+          const toStream = textBuffer.slice(0, safeEnd);
+          textBuffer = textBuffer.slice(safeEnd);
+
+          if (toStream) {
             response.write(
-              `data: ${JSON.stringify(buildChunkPayload(
-                completionId,
-                requestOptions.model.id,
-                { content: fullContent }
-              ))}\n\n`
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toStream }))}\n\n`
             );
           }
+        });
+
+        if (textBuffer && !toolCallDetected) {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: textBuffer }))}\n\n`
+          );
+        }
+
+        if (toolCallDetected) {
+          const toolCalls = filterToolCalls(extractToolCalls(toolCallBuffer), requestOptions.tools);
+          if (toolCalls) {
+            response.write(
+              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
+            );
+            response.write(
+              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
+            );
+          } else {
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toolCallBuffer }))}\n\n`
+            );
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+            );
+          }
+        } else {
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
           );

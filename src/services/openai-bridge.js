@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { createDeepseekDeltaDecoder, createSseParser } from "../utils/deepseek-sse.js";
 import { buildPromptFromMessages } from "../utils/prompt.js";
+import { buildToolSystemPrompt, createToolCallStreamParser, extractToolCalls } from "../utils/tool-prompt.js";
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
@@ -24,19 +25,40 @@ function toContentText(content) {
     .join("\n");
 }
 
+function normalizeToolCall(toolCall) {
+  const args = typeof toolCall.function.arguments === "string"
+    ? toolCall.function.arguments
+    : JSON.stringify(toolCall.function.arguments);
+  return `<tool_call={"name": "${toolCall.function.name}", "arguments": ${args}}`;
+}
+
 function normalizeMessages(messages) {
-  return (messages ?? []).map((message) => ({
-    role: message.role ?? "user",
-    content: toContentText(message.content)
-  }));
+  return (messages ?? []).flatMap((message) => {
+    if (message.role === "assistant" && message.tool_calls?.length) {
+      const content = message.content ?? "";
+      const calls = message.tool_calls.map(normalizeToolCall).join("\n");
+      return [{ role: "assistant", content: content ? `${content}\n${calls}` : calls }];
+    }
+    if (message.role === "tool") {
+      return [{ role: "tool", content: `TOOL_RESULT: ${toContentText(message.content)}` }];
+    }
+    return [{ role: message.role ?? "user", content: toContentText(message.content) }];
+  });
 }
 
 function resolveCompletionRequest(body) {
   assertNoLegacySearchOptions(body);
 
+  const tools = body?.tools;
+  const toolChoice = body?.tool_choice;
+  const toolPrompt = (tools?.length && toolChoice !== "none")
+    ? buildToolSystemPrompt(tools, toolChoice)
+    : null;
+
   return {
     model: resolveOpenAiModel(body?.model),
-    prompt: buildPromptFromMessages(normalizeMessages(body?.messages))
+    prompt: buildPromptFromMessages(normalizeMessages(body?.messages), toolPrompt),
+    tools: tools || null
   };
 }
 
@@ -161,6 +183,28 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
         content += text;
       });
 
+      const toolCalls = requestOptions.tools ? extractToolCalls(content) : null;
+
+      if (toolCalls) {
+        return {
+          id: `chatcmpl_${randomUUID()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: requestOptions.model.id,
+          choices: [
+            {
+              index: 0,
+              finish_reason: "tool_calls",
+              message: {
+                role: "assistant",
+                content: null,
+                tool_calls: toolCalls
+              }
+            }
+          ]
+        };
+      }
+
       return {
         id: `chatcmpl_${randomUUID()}`,
         object: "chat.completion",
@@ -179,6 +223,27 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
       };
     }
   });
+}
+
+function buildToolCallChunkPayload(completionId, model, toolCalls, finishReason) {
+  const toolCallDeltas = toolCalls.map((tc, index) => ({
+    index,
+    id: tc.id,
+    type: "function",
+    function: { name: tc.function.name, arguments: tc.function.arguments }
+  }));
+
+  const choice = finishReason
+    ? { index: 0, delta: {}, finish_reason: finishReason }
+    : { index: 0, delta: { tool_calls: toolCallDeltas } };
+
+  return {
+    id: completionId,
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model,
+    choices: [choice]
+  };
 }
 
 export async function streamOpenAiResponse(options) {
@@ -213,19 +278,56 @@ export async function streamOpenAiResponse(options) {
         ))}\n\n`
       );
 
-      await consumeTaggedStream(deepseekResponse.body, (delta) => {
-        response.write(
-          `data: ${JSON.stringify(buildChunkPayload(
-            completionId,
-            requestOptions.model.id,
-            { content: delta }
-          ))}\n\n`
-        );
-      });
+      if (requestOptions.tools) {
+        let emittedToolCalls = false;
 
-      response.write(
-        `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
-      );
+        const parser = createToolCallStreamParser(
+          (toolCalls) => {
+            emittedToolCalls = true;
+            response.write(
+              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
+            );
+            response.write(
+              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
+            );
+          },
+          (delta) => {
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(
+                completionId,
+                requestOptions.model.id,
+                { content: delta }
+              ))}\n\n`
+            );
+          }
+        );
+
+        await consumeTaggedStream(deepseekResponse.body, (text) => {
+          parser.push(text);
+        });
+        parser.flush();
+
+        if (!emittedToolCalls) {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+          );
+        }
+      } else {
+        await consumeTaggedStream(deepseekResponse.body, (delta) => {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(
+              completionId,
+              requestOptions.model.id,
+              { content: delta }
+            ))}\n\n`
+          );
+        });
+
+        response.write(
+          `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+        );
+      }
+
       response.end("data: [DONE]\n\n");
     }
   });

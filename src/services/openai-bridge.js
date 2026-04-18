@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { createDeepseekDeltaDecoder, createSseParser } from "../utils/deepseek-sse.js";
 import { buildPromptFromMessages } from "../utils/prompt.js";
-import { buildToolSystemPrompt, createToolCallStreamParser, extractToolCalls } from "../utils/tool-prompt.js";
+import { buildToolSystemPrompt, extractToolCalls } from "../utils/tool-prompt.js";
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
@@ -279,35 +279,29 @@ export async function streamOpenAiResponse(options) {
       );
 
       if (requestOptions.tools) {
-        let emittedToolCalls = false;
+        let fullContent = "";
+        await consumeTaggedStream(deepseekResponse.body, (text) => {
+          fullContent += text;
+        });
 
-        const parser = createToolCallStreamParser(
-          (toolCalls) => {
-            emittedToolCalls = true;
-            response.write(
-              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
-            );
-            response.write(
-              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
-            );
-          },
-          (delta) => {
+        const toolCalls = extractToolCalls(fullContent);
+        if (toolCalls) {
+          response.write(
+            `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
+          );
+          response.write(
+            `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
+          );
+        } else {
+          if (fullContent) {
             response.write(
               `data: ${JSON.stringify(buildChunkPayload(
                 completionId,
                 requestOptions.model.id,
-                { content: delta }
+                { content: fullContent }
               ))}\n\n`
             );
           }
-        );
-
-        await consumeTaggedStream(deepseekResponse.body, (text) => {
-          parser.push(text);
-        });
-        parser.flush();
-
-        if (!emittedToolCalls) {
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
           );

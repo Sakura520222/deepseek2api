@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-const TOOL_CALL_MARKER = "<tool_call=";
+const TOOL_CALL_PREFIX = "<tool_call";
 
 export function buildToolSystemPrompt(tools, toolChoice) {
   const toolDescriptions = tools.map((tool) => {
@@ -10,7 +10,7 @@ export function buildToolSystemPrompt(tools, toolChoice) {
     return `### ${fn.name}\nDescription: ${fn.description || "No description"}\nParameters:\n${params}`;
   }).filter(Boolean).join("\n\n");
 
-  let instruction = `# Available Tools\n\nYou have access to the following tools. To call a tool, output EXACTLY the following format:\n${TOOL_CALL_MARKER}{"name": "function_name", "arguments": {"key": "value"}}\n\nYou may call one or more tools. Do NOT output any other text when calling tools.\n\n## Tools\n\n${toolDescriptions}`;
+  let instruction = `# Available Tools\n\nYou have access to the following tools. To call a tool, output EXACTLY the following format on a new line:\n<tool_call={"name": "function_name", "arguments": {"key": "value"}}\nYou may call one or more tools by using multiple such lines. Do NOT output any other text on the same line as a tool call.\n\n## Tools\n\n${toolDescriptions}`;
 
   if (toolChoice === "none") {
     return null;
@@ -24,7 +24,7 @@ export function buildToolSystemPrompt(tools, toolChoice) {
     instruction += `\n\nIMPORTANT: You MUST call the function "${toolChoice.function.name}". Do not respond with plain text.`;
   }
 
-  instruction += "\n\nIf you do NOT need to call any tool, respond normally without any <tool_call= markers.";
+  instruction += "\n\nIf you do NOT need to call any tool, respond normally without any <tool_call markers.";
 
   return instruction;
 }
@@ -39,47 +39,6 @@ function formatParameters(parameters) {
     const desc = schema.description || "";
     return `- ${name} (${type}, ${req})${desc ? `: ${desc}` : ""}`;
   }).join("\n");
-}
-
-export function extractToolCalls(text) {
-  if (!text || !text.includes(TOOL_CALL_MARKER)) return null;
-
-  const toolCalls = [];
-  let searchStart = 0;
-
-  while (true) {
-    const markerIndex = text.indexOf(TOOL_CALL_MARKER, searchStart);
-    if (markerIndex === -1) break;
-
-    const jsonStart = markerIndex + TOOL_CALL_MARKER.length;
-    const jsonResult = parseJsonFrom(text, jsonStart);
-    if (!jsonResult) {
-      searchStart = jsonStart;
-      continue;
-    }
-
-    try {
-      const parsed = JSON.parse(jsonResult.json);
-      if (parsed.name) {
-        toolCalls.push({
-          id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
-          type: "function",
-          function: {
-            name: parsed.name,
-            arguments: typeof parsed.arguments === "string"
-              ? parsed.arguments
-              : JSON.stringify(parsed.arguments ?? {})
-          }
-        });
-      }
-    } catch {
-      // skip unparseable
-    }
-
-    searchStart = jsonResult.endIndex;
-  }
-
-  return toolCalls.length > 0 ? toolCalls : null;
 }
 
 function parseJsonFrom(text, startIndex) {
@@ -120,6 +79,91 @@ function parseJsonFrom(text, startIndex) {
   return depth === 0 ? { json: text.slice(startIndex), endIndex: text.length } : null;
 }
 
+function parseToolCallInline(text, markerIndex) {
+  const eqIndex = markerIndex + TOOL_CALL_PREFIX.length;
+  if (eqIndex >= text.length || text[eqIndex] !== "=") return null;
+
+  const jsonStart = eqIndex + 1;
+  const jsonResult = parseJsonFrom(text, jsonStart);
+  if (!jsonResult) return null;
+
+  try {
+    const parsed = JSON.parse(jsonResult.json);
+    if (!parsed.name) return null;
+    return {
+      toolCall: {
+        id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: parsed.name,
+          arguments: typeof parsed.arguments === "string"
+            ? parsed.arguments
+            : JSON.stringify(parsed.arguments ?? {})
+        }
+      },
+      endIndex: jsonResult.endIndex
+    };
+  } catch {
+    return null;
+  }
+}
+
+function parseToolCallAttr(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  const nameMatch = rest.match(/^\s+name\s*=\s*"([^"]+)"/);
+  if (!nameMatch) return null;
+
+  const afterAttr = afterPrefix + nameMatch[0].length;
+
+  const gtIndex = text.indexOf(">", afterAttr);
+  if (gtIndex === -1) return null;
+
+  const jsonStart = gtIndex + 1;
+  const jsonResult = parseJsonFrom(text, jsonStart);
+  if (!jsonResult) return null;
+
+  try {
+    const parsed = JSON.parse(jsonResult.json);
+    return {
+      toolCall: {
+        id: `call_${randomUUID().replace(/-/g, "").slice(0, 24)}`,
+        type: "function",
+        function: {
+          name: nameMatch[1],
+          arguments: JSON.stringify(parsed)
+        }
+      },
+      endIndex: jsonResult.endIndex
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function extractToolCalls(text) {
+  if (!text || !text.includes(TOOL_CALL_PREFIX)) return null;
+
+  const toolCalls = [];
+  let searchStart = 0;
+
+  while (true) {
+    const markerIndex = text.indexOf(TOOL_CALL_PREFIX, searchStart);
+    if (markerIndex === -1) break;
+
+    const result = parseToolCallInline(text, markerIndex) || parseToolCallAttr(text, markerIndex);
+    if (result) {
+      toolCalls.push(result.toolCall);
+      searchStart = result.endIndex;
+    } else {
+      searchStart = markerIndex + TOOL_CALL_PREFIX.length;
+    }
+  }
+
+  return toolCalls.length > 0 ? toolCalls : null;
+}
+
 export function createToolCallStreamParser(onToolCalls, onText) {
   let buffer = "";
   let decided = false;
@@ -141,7 +185,7 @@ export function createToolCallStreamParser(onToolCalls, onText) {
 
       buffer += text;
 
-      const markerIndex = buffer.indexOf(TOOL_CALL_MARKER);
+      const markerIndex = buffer.indexOf(TOOL_CALL_PREFIX);
       if (markerIndex !== -1) {
         decided = true;
         isToolCall = true;

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 const TOOL_CALL_PREFIX = "<tool_call";
 
 export function buildToolSystemPrompt(tools, toolChoice) {
+  const toolNames = tools.map((tool) => tool.function?.name).filter(Boolean);
   const toolDescriptions = tools.map((tool) => {
     if (tool.type !== "function" || !tool.function) return null;
     const fn = tool.function;
@@ -10,7 +11,9 @@ export function buildToolSystemPrompt(tools, toolChoice) {
     return `### ${fn.name}\nDescription: ${fn.description || "No description"}\nParameters:\n${params}`;
   }).filter(Boolean).join("\n\n");
 
-  let instruction = `# Available Tools\n\nYou have access to the following tools. To call a tool, output EXACTLY the following format on a new line:\n<tool_call={"name": "function_name", "arguments": {"key": "value"}}\nYou may call one or more tools by using multiple such lines. Do NOT output any other text on the same line as a tool call.\n\n## Tools\n\n${toolDescriptions}`;
+  const nameList = toolNames.map((n) => `- ${n}`).join("\n");
+
+  let instruction = `# Available Tools\n\nYou have access to the following tools. To call a tool, output EXACTLY the following format on a new line:\n<tool_call={"name": "EXACT_TOOL_NAME", "arguments": {"key": "value"}}\nYou may call one or more tools by using multiple such lines. Do NOT output any other text on the same line as a tool call.\n\nCRITICAL:\n- You MUST ONLY call tools from the list below.\n- You MUST use the EXACT tool name as shown (e.g. "${toolNames[0] || "tool_name"}"), NOT abbreviated forms.\n- Do NOT call any tool that is not listed, even if it was mentioned in previous conversation.\n\n## Exact Tool Names\n\n${nameList}\n\n## Tool Details\n\n${toolDescriptions}`;
 
   if (toolChoice === "none") {
     return null;

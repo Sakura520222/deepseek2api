@@ -40,10 +40,29 @@ function normalizeMessages(messages) {
       return [{ role: "assistant", content: content ? `${content}\n${calls}` : calls }];
     }
     if (message.role === "tool") {
-      return [{ role: "tool", content: `TOOL_RESULT: ${toContentText(message.content)}` }];
+      const resultText = toContentText(message.content);
+      const callId = message.tool_call_id ? ` (call ${message.tool_call_id})` : "";
+      return [{ role: "tool", content: `TOOL_RESULT${callId}: ${resultText}` }];
     }
     return [{ role: message.role ?? "user", content: toContentText(message.content) }];
   });
+}
+
+function filterToolCalls(toolCalls, tools) {
+  if (!toolCalls || !tools) return null;
+
+  const validNames = tools.map((t) => t.function?.name).filter(Boolean);
+
+  const filtered = toolCalls.map((tc) => {
+    if (validNames.includes(tc.function.name)) return tc;
+
+    const match = validNames.find((name) => name.endsWith("__" + tc.function.name) || name.endsWith("." + tc.function.name));
+    if (match) return { ...tc, function: { ...tc.function, name: match } };
+
+    return null;
+  }).filter(Boolean);
+
+  return filtered.length > 0 ? filtered : null;
 }
 
 function resolveCompletionRequest(body) {
@@ -183,7 +202,7 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
         content += text;
       });
 
-      const toolCalls = requestOptions.tools ? extractToolCalls(content) : null;
+      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(content), requestOptions.tools) : null;
 
       if (toolCalls) {
         return {
@@ -284,7 +303,7 @@ export async function streamOpenAiResponse(options) {
           fullContent += text;
         });
 
-        const toolCalls = extractToolCalls(fullContent);
+        const toolCalls = filterToolCalls(extractToolCalls(fullContent), requestOptions.tools);
         if (toolCalls) {
           response.write(
             `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`

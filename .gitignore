@@ -6,3 +6,4 @@ data/app.json
 data/*.log
 release/
 Thumbs.db
+.claude/

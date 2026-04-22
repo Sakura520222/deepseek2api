@@ -7,8 +7,8 @@ import { createChatSession, deleteChatSession } from "./chat-session-service.js"
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
 
-const THINK_OPEN_TAG = "<think>";
-const THINK_CLOSE_TAG = "</think>";
+const THINK_OPEN_TAG = "<think/>";
+const THINK_CLOSE_TAG = "</think/>";
 
 function toContentText(content) {
   if (typeof content === "string") {
@@ -36,13 +36,16 @@ function normalizeMessages(messages) {
   return (messages ?? []).flatMap((message) => {
     if (message.role === "assistant" && message.tool_calls?.length) {
       const content = message.content ?? "";
-      const calls = message.tool_calls.map(normalizeToolCall).join("\n");
+      const calls = message.tool_calls.map((tc) =>
+        `[Called tool: ${tc.function.name}]\n${normalizeToolCall(tc)}`
+      ).join("\n");
       return [{ role: "assistant", content: content ? `${content}\n${calls}` : calls }];
     }
     if (message.role === "tool") {
       const resultText = toContentText(message.content);
+      const toolName = message.name || "unknown";
       const callId = message.tool_call_id ? ` (call ${message.tool_call_id})` : "";
-      return [{ role: "tool", content: `TOOL_RESULT${callId}: ${resultText}` }];
+      return [{ role: "tool", content: `[Tool Result for "${toolName}"${callId}]\n${resultText}` }];
     }
     return [{ role: message.role ?? "user", content: toContentText(message.content) }];
   });
@@ -56,7 +59,14 @@ function filterToolCalls(toolCalls, tools) {
   const filtered = toolCalls.map((tc) => {
     if (validNames.includes(tc.function.name)) return tc;
 
-    const match = validNames.find((name) => name.endsWith("__" + tc.function.name) || name.endsWith("." + tc.function.name));
+    // Fuzzy: case-insensitive, underscore/hyphen interchange
+    const tcLower = tc.function.name.toLowerCase().replace(/-/g, "_");
+    const match = validNames.find((name) => {
+      const nameLower = name.toLowerCase().replace(/-/g, "_");
+      return nameLower === tcLower
+        || name.endsWith("__" + tc.function.name)
+        || name.endsWith("." + tc.function.name);
+    });
     if (match) return { ...tc, function: { ...tc.function, name: match } };
 
     return null;
@@ -108,7 +118,7 @@ function createThinkingTagger() {
   return {
     push(delta) {
       if (!delta?.text) {
-        return "";
+        return { text: "", kind: currentKind };
       }
 
       let prefix = "";
@@ -122,7 +132,7 @@ function createThinkingTagger() {
         currentKind = delta.kind;
       }
 
-      return prefix + delta.text;
+      return { text: prefix + delta.text, kind: currentKind };
     },
     flush() {
       if (currentKind !== "thinking") {
@@ -135,7 +145,7 @@ function createThinkingTagger() {
   };
 }
 
-async function consumeTaggedStream(stream, onText) {
+async function consumeTaggedStream(stream, onTagged) {
   if (!stream) {
     return;
   }
@@ -144,9 +154,9 @@ async function consumeTaggedStream(stream, onText) {
   const deltaDecoder = createDeepseekDeltaDecoder();
   const tagger = createThinkingTagger();
   const parser = createSseParser(({ data }) => {
-    const text = tagger.push(deltaDecoder.consume(data));
-    if (text) {
-      onText(text);
+    const tagged = tagger.push(deltaDecoder.consume(data));
+    if (tagged.text) {
+      onTagged(tagged);
     }
   });
 
@@ -157,7 +167,7 @@ async function consumeTaggedStream(stream, onText) {
 
   const suffix = tagger.flush();
   if (suffix) {
-    onText(suffix);
+    onTagged({ text: suffix, kind: "thinking" });
   }
 }
 
@@ -198,8 +208,8 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
       const { response } = await startCompletion({ account, requestOptions, sessionId });
       let content = "";
 
-      await consumeTaggedStream(response.body, (text) => {
-        content += text;
+      await consumeTaggedStream(response.body, (tagged) => {
+        content += tagged.text;
       });
 
       const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(content), requestOptions.tools) : null;
@@ -265,6 +275,30 @@ function buildToolCallChunkPayload(completionId, model, toolCalls, finishReason)
   };
 }
 
+const TOOL_CALL_MARKERS = ["<tool_call", "<function_call"];
+
+function findToolCallMarker(text) {
+  let earliest = -1;
+  for (const marker of TOOL_CALL_MARKERS) {
+    const idx = text.indexOf(marker);
+    if (idx !== -1 && (earliest === -1 || idx < earliest)) {
+      earliest = idx;
+    }
+  }
+  return earliest;
+}
+
+function isPartialMarker(text) {
+  for (const marker of TOOL_CALL_MARKERS) {
+    for (let i = Math.max(0, text.length - marker.length); i < text.length; i++) {
+      if (text[i] !== "<") continue;
+      const tail = text.slice(i);
+      if (marker.startsWith(tail)) return true;
+    }
+  }
+  return false;
+}
+
 export async function streamOpenAiResponse(options) {
   const { account, body, deleteAfterFinish = false, response } = options;
   const completionId = `chatcmpl_${randomUUID()}`;
@@ -298,12 +332,25 @@ export async function streamOpenAiResponse(options) {
       );
 
       if (requestOptions.tools) {
-        const MARKER = "<tool_call";
         let toolCallDetected = false;
         let toolCallBuffer = "";
         let textBuffer = "";
 
-        await consumeTaggedStream(deepseekResponse.body, (text) => {
+        await consumeTaggedStream(deepseekResponse.body, (tagged) => {
+          // Only check for tool calls in response content, not thinking
+          if (tagged.kind === "thinking") {
+            if (!toolCallDetected) {
+              response.write(
+                `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: tagged.text }))}\n\n`
+              );
+            } else {
+              toolCallBuffer += tagged.text;
+            }
+            return;
+          }
+
+          const text = tagged.text;
+
           if (toolCallDetected) {
             toolCallBuffer += text;
             return;
@@ -311,7 +358,7 @@ export async function streamOpenAiResponse(options) {
 
           textBuffer += text;
 
-          const markerIndex = textBuffer.indexOf(MARKER);
+          const markerIndex = findToolCallMarker(textBuffer);
           if (markerIndex !== -1) {
             toolCallDetected = true;
             const before = textBuffer.slice(0, markerIndex);
@@ -325,13 +372,18 @@ export async function streamOpenAiResponse(options) {
             return;
           }
 
+          // Safe streaming: hold back partial marker prefixes
           let safeEnd = textBuffer.length;
-          for (let i = Math.max(0, textBuffer.length - MARKER.length); i < textBuffer.length; i++) {
-            if (textBuffer[i] !== "<") continue;
-            const tail = textBuffer.slice(i);
-            if (MARKER.startsWith(tail)) {
-              safeEnd = i;
-              break;
+          if (isPartialMarker(textBuffer)) {
+            for (let i = Math.max(0, textBuffer.length - 20); i < textBuffer.length; i++) {
+              if (textBuffer[i] !== "<" && textBuffer[i] !== "`") continue;
+              const tail = textBuffer.slice(i);
+              let isPartial = false;
+              for (const marker of TOOL_CALL_MARKERS) {
+                if (marker.startsWith(tail)) { isPartial = true; break; }
+              }
+              if (tail.startsWith("```")) { isPartial = true; }
+              if (isPartial) { safeEnd = i; break; }
             }
           }
 
@@ -374,12 +426,12 @@ export async function streamOpenAiResponse(options) {
           );
         }
       } else {
-        await consumeTaggedStream(deepseekResponse.body, (delta) => {
+        await consumeTaggedStream(deepseekResponse.body, (tagged) => {
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(
               completionId,
               requestOptions.model.id,
-              { content: delta }
+              { content: tagged.text }
             ))}\n\n`
           );
         });

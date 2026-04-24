@@ -7,9 +7,6 @@ import { createChatSession, deleteChatSession } from "./chat-session-service.js"
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel, resolveToolCallModel } from "./openai-request.js";
 
-const THINK_OPEN_TAG = "<think>";
-const THINK_CLOSE_TAG = "</think>";
-
 function toContentText(content) {
   if (typeof content === "string") {
     return content;
@@ -49,10 +46,6 @@ function normalizeMessages(messages) {
     }
     return [{ role: message.role ?? "user", content: toContentText(message.content) }];
   });
-}
-
-function stripThinkingTags(text) {
-  return text.replace(/<think\/>[\s\S]*?<\/think\/>/g, "");
 }
 
 function filterToolCalls(toolCalls, tools) {
@@ -119,39 +112,6 @@ async function startCompletion({ account, requestOptions, sessionId }) {
   });
 }
 
-function createThinkingTagger() {
-  let currentKind = null;
-
-  return {
-    push(delta) {
-      if (!delta?.text) {
-        return { text: "", kind: currentKind };
-      }
-
-      let prefix = "";
-      if (delta.kind !== currentKind) {
-        if (currentKind === "thinking") {
-          prefix += THINK_CLOSE_TAG;
-        }
-        if (delta.kind === "thinking") {
-          prefix += THINK_OPEN_TAG;
-        }
-        currentKind = delta.kind;
-      }
-
-      return { text: prefix + delta.text, kind: currentKind };
-    },
-    flush() {
-      if (currentKind !== "thinking") {
-        return "";
-      }
-
-      currentKind = "response";
-      return THINK_CLOSE_TAG;
-    }
-  };
-}
-
 async function consumeTaggedStream(stream, onTagged) {
   if (!stream) {
     return;
@@ -159,11 +119,10 @@ async function consumeTaggedStream(stream, onTagged) {
 
   const decoder = new TextDecoder();
   const deltaDecoder = createDeepseekDeltaDecoder();
-  const tagger = createThinkingTagger();
   const parser = createSseParser(({ data }) => {
-    const tagged = tagger.push(deltaDecoder.consume(data));
-    if (tagged.text) {
-      onTagged(tagged);
+    const delta = deltaDecoder.consume(data);
+    if (delta?.text) {
+      onTagged({ kind: delta.kind, text: delta.text });
     }
   });
 
@@ -171,11 +130,6 @@ async function consumeTaggedStream(stream, onTagged) {
     parser.push(decoder.decode(chunk, { stream: true }));
   }
   parser.flush();
-
-  const suffix = tagger.flush();
-  if (suffix) {
-    onTagged({ text: suffix, kind: "thinking" });
-  }
 }
 
 function buildChunkPayload(completionId, model, delta, finishReason) {
@@ -214,48 +168,49 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
     onComplete: async (sessionId) => {
       const { response } = await startCompletion({ account, requestOptions, sessionId });
       let content = "";
+      let reasoningContent = "";
 
       await consumeTaggedStream(response.body, (tagged) => {
-        content += tagged.text;
+        if (tagged.kind === "thinking") {
+          reasoningContent += tagged.text;
+        } else {
+          content += tagged.text;
+        }
       });
 
-      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(stripThinkingTags(content)), requestOptions.tools) : null;
+      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(content), requestOptions.tools) : null;
 
       if (toolCalls) {
+        const message = {
+          role: "assistant",
+          content: null,
+          tool_calls: toolCalls
+        };
+        if (reasoningContent) {
+          message.reasoning_content = reasoningContent;
+        }
         return {
           id: `chatcmpl_${randomUUID()}`,
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: requestOptions.model.id,
-          choices: [
-            {
-              index: 0,
-              finish_reason: "tool_calls",
-              message: {
-                role: "assistant",
-                content: null,
-                tool_calls: toolCalls
-              }
-            }
-          ]
+          choices: [{ index: 0, finish_reason: "tool_calls", message }]
         };
       }
 
+      const message = {
+        role: "assistant",
+        content
+      };
+      if (reasoningContent) {
+        message.reasoning_content = reasoningContent;
+      }
       return {
         id: `chatcmpl_${randomUUID()}`,
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: requestOptions.model.id,
-        choices: [
-          {
-            index: 0,
-            finish_reason: "stop",
-            message: {
-              role: "assistant",
-              content
-            }
-          }
-        ]
+        choices: [{ index: 0, finish_reason: "stop", message }]
       };
     }
   });
@@ -344,14 +299,10 @@ export async function streamOpenAiResponse(options) {
         let textBuffer = "";
 
         await consumeTaggedStream(deepseekResponse.body, (tagged) => {
-          // Only check for tool calls in response content, not thinking
           if (tagged.kind === "thinking") {
-            if (!toolCallDetected) {
-              response.write(
-                `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: tagged.text }))}\n\n`
-              );
-            }
-            // After tool call detected, discard thinking content — it shouldn't be in the tool call buffer
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { reasoning_content: tagged.text }))}\n\n`
+            );
             return;
           }
 
@@ -433,11 +384,14 @@ export async function streamOpenAiResponse(options) {
         }
       } else {
         await consumeTaggedStream(deepseekResponse.body, (tagged) => {
+          const delta = tagged.kind === "thinking"
+            ? { reasoning_content: tagged.text }
+            : { content: tagged.text };
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(
               completionId,
               requestOptions.model.id,
-              { content: tagged.text }
+              delta
             ))}\n\n`
           );
         });

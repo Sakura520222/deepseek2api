@@ -1,3 +1,5 @@
+import { config } from "../config.js";
+
 const DEFAULT_OPENAI_MODEL = "deepseek-chat-fast";
 const SEARCH_MODEL_SUFFIX = "-search";
 
@@ -57,3 +59,8 @@ export function assertNoLegacySearchOptions(body) {
 }
 
 export { DEFAULT_OPENAI_MODEL };
+
+export function resolveToolCallModel(originalModel) {
+  if (!config.toolCallModel) return originalModel;
+  return resolveOpenAiModel(config.toolCallModel);
+}

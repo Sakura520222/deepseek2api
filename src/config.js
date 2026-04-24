@@ -17,6 +17,7 @@ const adminPassword = process.env.APP_ADMIN_PASSWORD ?? "";
 
 export const config = Object.freeze({
   port: Number(process.env.PORT ?? 3000),
+  toolCallModel: process.env.TOOL_CALL_MODEL ?? "",
   dataFile: join(dataDirectory, "app.json"),
   sessionCookieName: "ds_reverse_session",
   sessionTtlMs: 1000 * 60 * 60 * 24 * 7,

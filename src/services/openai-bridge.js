@@ -5,10 +5,10 @@ import { buildPromptFromMessages } from "../utils/prompt.js";
 import { buildToolSystemPrompt, extractToolCalls } from "../utils/tool-prompt.js";
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
-import { assertNoLegacySearchOptions, resolveOpenAiModel } from "./openai-request.js";
+import { assertNoLegacySearchOptions, resolveOpenAiModel, resolveToolCallModel } from "./openai-request.js";
 
-const THINK_OPEN_TAG = "<think/>";
-const THINK_CLOSE_TAG = "</think/>";
+const THINK_OPEN_TAG = "<think>";
+const THINK_CLOSE_TAG = "</think>";
 
 function toContentText(content) {
   if (typeof content === "string") {
@@ -51,6 +51,10 @@ function normalizeMessages(messages) {
   });
 }
 
+function stripThinkingTags(text) {
+  return text.replace(/<think\/>[\s\S]*?<\/think\/>/g, "");
+}
+
 function filterToolCalls(toolCalls, tools) {
   if (!toolCalls || !tools) return null;
 
@@ -84,8 +88,11 @@ function resolveCompletionRequest(body) {
     ? buildToolSystemPrompt(tools, toolChoice)
     : null;
 
+  const resolvedModel = resolveOpenAiModel(body?.model);
+  const model = (tools?.length) ? resolveToolCallModel(resolvedModel) : resolvedModel;
+
   return {
-    model: resolveOpenAiModel(body?.model),
+    model,
     prompt: buildPromptFromMessages(normalizeMessages(body?.messages), toolPrompt),
     tools: tools || null
   };
@@ -212,7 +219,7 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
         content += tagged.text;
       });
 
-      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(content), requestOptions.tools) : null;
+      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(stripThinkingTags(content)), requestOptions.tools) : null;
 
       if (toolCalls) {
         return {
@@ -343,9 +350,8 @@ export async function streamOpenAiResponse(options) {
               response.write(
                 `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: tagged.text }))}\n\n`
               );
-            } else {
-              toolCallBuffer += tagged.text;
             }
+            // After tool call detected, discard thinking content — it shouldn't be in the tool call buffer
             return;
           }
 

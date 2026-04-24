@@ -181,11 +181,60 @@ function parseCodeBlocks(text) {
   return toolCalls.length > 0 ? { toolCalls, endIndex: lastIndex } : null;
 }
 
+// Strategy 6: <tool_call name="..."><parameter name="...">value</parameter>...</tool_call >
+// Also handles <function_call name="..."><parameter name="...">value</parameter></function_call>
+function parseXmlParamFormat(text, markerIndex) {
+  const afterPrefix = markerIndex === text.indexOf(TOOL_CALL_PREFIX, markerIndex)
+    ? markerIndex + TOOL_CALL_PREFIX.length
+    : markerIndex + FUNCTION_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  const nameMatch = rest.match(/^\s+name\s*=\s*"([^"]+)"/);
+  if (!nameMatch) return null;
+
+  const afterAttr = afterPrefix + nameMatch[0].length;
+  const gtIndex = text.indexOf(">", afterAttr);
+  if (gtIndex === -1) return null;
+
+  // Detect closing tag based on marker type
+  const isToolCall = text.slice(markerIndex).startsWith(TOOL_CALL_PREFIX);
+  const closeTag = isToolCall ? "</tool_call" : "</function_call";
+  const closeIndex = text.indexOf(closeTag, gtIndex + 1);
+  const end = closeIndex !== -1 ? text.indexOf(">", closeIndex) + 1 : text.length;
+  const body = text.slice(gtIndex + 1, closeIndex !== -1 ? closeIndex : text.length);
+
+  // Try to extract <parameter> sub-tags
+  const paramRe = /<parameter\s+name\s*=\s*"([^"]+)">([\s\S]*?)<\/parameter>/g;
+  const args = {};
+  let paramCount = 0;
+  let m;
+  while ((m = paramRe.exec(body)) !== null) {
+    args[m[1]] = m[2].trim();
+    paramCount++;
+  }
+
+  if (paramCount > 0) {
+    return { toolCalls: [makeToolCall(nameMatch[1], args)], endIndex: end };
+  }
+
+  // Fallback: try parsing body as JSON (reuses existing attr behavior)
+  const trimmed = body.trim();
+  if (trimmed) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      return { toolCalls: [makeToolCall(nameMatch[1], parsed)], endIndex: end };
+    } catch { /* ignore */ }
+  }
+
+  // No arguments
+  return { toolCalls: [makeToolCall(nameMatch[1], {})], endIndex: end };
+}
+
 // --- Marker-based strategies dispatcher ---
 
 const MARKER_STRATEGIES = [
-  { prefix: TOOL_CALL_PREFIX, parsers: [parseInlineFormat, parseAttrFormat, parseLooseInline] },
-  { prefix: FUNCTION_CALL_PREFIX, parsers: [parseFunctionCallXml] },
+  { prefix: TOOL_CALL_PREFIX, parsers: [parseInlineFormat, parseAttrFormat, parseLooseInline, parseXmlParamFormat] },
+  { prefix: FUNCTION_CALL_PREFIX, parsers: [parseFunctionCallXml, parseXmlParamFormat] },
 ];
 
 // --- Main extraction ---
@@ -360,11 +409,12 @@ export function buildToolSystemPrompt(tools, toolChoice) {
     ? Object.keys(tools[0].function.parameters.properties).slice(0, 2)
     : ["param1"];
 
+  const exampleArgsStr = exampleArgs.map(a => `"${a}": "value"`).join(", ");
+
   let instruction = `# Available Tools
 
-You have access to the following tools. To call a tool, output EXACTLY the following format on a new line:
-<tool_call={"name": "EXACT_TOOL_NAME", "arguments": {"key": "value"}}
-You may call one or more tools by using multiple such lines. Do NOT output any other text on the same line as a tool call.
+You have access to the following tools. To call a tool, you MUST output EXACTLY this format on its own line:
+<tool_call={"name": "EXACT_TOOL_NAME", "arguments": {"key": "value"}}>
 
 CRITICAL RULES:
 - You MUST ONLY call tools from the list below.
@@ -372,6 +422,10 @@ CRITICAL RULES:
 - Do NOT call any tool that is not listed, even if it was mentioned in previous conversation.
 - Each tool call MUST be on its OWN separate line.
 - Do NOT wrap tool calls in code blocks or any other formatting.
+- Do NOT use XML-style parameter tags (e.g. <parameter name="...">).
+- Do NOT output tool calls inside thinking or reasoning blocks. Tool calls MUST only appear in the final response.
+- Tool descriptions contain ALL information needed to use them. Do NOT read files, documentation, or use other tools to "learn" or "figure out" how a tool works.
+- When a user request clearly matches a tool's purpose, call that tool DIRECTLY. Do NOT use file-reading or exploratory tools as an intermediate step.
 
 ## Exact Tool Names
 
@@ -381,10 +435,16 @@ ${nameList}
 
 ${toolDescriptions}
 
-## Example
+## Correct Example
 
 USER: Please use ${exampleTool} for me
-ASSISTANT: <tool_call={"name": "${exampleTool}", "arguments": {${exampleArgs.map(a => `"${a}": "value"`).join(", ")}}}`;
+ASSISTANT: <tool_call={"name": "${exampleTool}", "arguments": {${exampleArgsStr}}}>
+
+## Incorrect Examples (DO NOT DO THIS)
+
+BAD: <tool_call name="${exampleTool}"><parameter name="${exampleArgs[0]}">value</parameter></tool_call >
+BAD: \`\`\`tool_call\n{"name": "${exampleTool}", "arguments": {${exampleArgsStr}}}\n\`\`\`
+BAD: <function_call name="${exampleTool}">{"${exampleArgs[0]}": "value"}</function_call>`;
 
   if (toolChoice === "none") {
     return null;

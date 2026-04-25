@@ -269,3 +269,5 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 ## License
 
 This project is licensed under the [MIT License](./LICENSE).
+
+[原仓库](https://github.com/TQZHR/deepseek2api)

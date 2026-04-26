@@ -224,7 +224,6 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       let reasoningBlockOpen = false;
       let textBlockOpen = false;
       let textAccumulator = "";
-      let reasoningAccumulator = "";
       let toolCallDetected = false;
       let toolCallBuffer = "";
       let hasToolCalls = false;
@@ -276,7 +275,6 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
               index: blockIndex,
               delta: { type: "thinking_delta", thinking: tagged.text }
             });
-            reasoningAccumulator += tagged.text;
             return;
           }
 
@@ -388,7 +386,6 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
               index: blockIndex,
               delta: { type: "thinking_delta", thinking: tagged.text }
             });
-            reasoningAccumulator += tagged.text;
             return;
           }
 

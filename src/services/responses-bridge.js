@@ -80,13 +80,18 @@ function normalizeResponsesTools(tools) {
       function: {
         name: t.name,
         description: t.description ?? "",
-        parameters: t.parameters ?? {}
+        parameters: t.parameters ?? t.input_schema ?? t.inputSchema ?? {}
       }
     }));
 }
 
 function normalizeResponsesToolChoice(toolChoice, tools) {
-  if (!tools?.length) return null;
+  if (!tools?.length) {
+    if (toolChoice && toolChoice !== "none") {
+      console.warn("[responses-bridge] tool_choice '%s' specified but no tools provided; ignoring tool_choice", toolChoice?.type ? toolChoice.type : toolChoice);
+    }
+    return null;
+  }
   if (!toolChoice || toolChoice === "auto") return "auto";
   if (toolChoice === "none") return "none";
   if (toolChoice === "required") return "required";
@@ -103,13 +108,24 @@ function resolveResponsesRequest(body) {
     ? buildToolSystemPrompt(tools, toolChoice)
     : null;
 
-  const messages = normalizeResponsesInput(body.input, body.instructions);
+  const instructions = [body.instructions, toolPrompt].filter(Boolean).join("\n\n") || undefined;
+  const input = body.input ?? body.messages;
+  const messages = normalizeResponsesInput(input, instructions);
   const resolvedModel = resolveOpenAiModel(body.model);
   const model = tools?.length ? resolveToolCallModel(resolvedModel) : resolvedModel;
 
+  if (process.env.DEBUG_TOOL_CALL) {
+    console.log("[responses-bridge] model:", body.model, "-> resolved:", resolvedModel.id,
+      "| tools:", tools?.length, "| toolChoice:", toolChoice,
+      "| input type:", Array.isArray(input) ? "array" : typeof input,
+      "| input length:", Array.isArray(input) ? input.length : (typeof input === "string" ? input.length : 0),
+      "| toolPrompt:", toolPrompt ? `${toolPrompt.length} chars` : "null");
+    console.log("[responses-bridge] prompt:\n", buildPromptFromMessages(messages, null));
+  }
+
   return {
     model,
-    prompt: buildPromptFromMessages(messages, toolPrompt),
+    prompt: buildPromptFromMessages(messages, null),
     tools
   };
 }
@@ -224,6 +240,35 @@ function emitResponseTextChunk(writeSSE, outIdx, text, state) {
   state.emittedText += text;
 }
 
+function emitReasoningDone(writeSSE, state) {
+  if (!state.reasoningItemId) return;
+  writeSSE("response.reasoning_text.done", {
+    item_id: state.reasoningItemId,
+    output_index: 0, text: state.reasoningAccumulator
+  });
+  writeSSE("response.output_item.done", {
+    output_index: 0,
+    item: { type: "reasoning", id: state.reasoningItemId, summary: [{ type: "summary_text", text: state.reasoningAccumulator }] }
+  });
+}
+
+function emitMessageDone(writeSSE, state, text, outIdx) {
+  if (!state.messageItemId) return;
+  writeSSE("response.output_text.done", {
+    item_id: state.messageItemId,
+    output_index: outIdx, content_index: 0, text
+  });
+  writeSSE("response.content_part.done", {
+    item_id: state.messageItemId,
+    output_index: outIdx, content_index: 0,
+    part: { type: "output_text", text }
+  });
+  writeSSE("response.output_item.done", {
+    output_index: outIdx,
+    item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text }] }
+  });
+}
+
 export async function streamResponsesResult({ response, account, body, deleteAfterFinish }) {
   const responseId = `resp_${randomUUID()}`;
   const requestOptions = resolveResponsesRequest(body);
@@ -263,7 +308,8 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         emittedText: "",
         reasoningAccumulator: "",
         toolCallDetected: false,
-        toolCallBuffer: ""
+        toolCallBuffer: "",
+        toolCalls: null
       };
 
       const textOutputBaseIdx = () => state.reasoningItemId ? 1 : 0;
@@ -330,36 +376,12 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           state.textAccumulator = "";
         }
 
-        if (state.reasoningItemId) {
-          writeSSE("response.reasoning_text.done", {
-            item_id: state.reasoningItemId,
-            output_index: 0, text: state.reasoningAccumulator
-          });
-          writeSSE("response.output_item.done", {
-            output_index: 0,
-            item: { type: "reasoning", id: state.reasoningItemId, summary: [{ type: "summary_text", text: state.reasoningAccumulator }] }
-          });
-        }
-
-        if (state.messageItemId) {
-          const outIdx = textOutputBaseIdx();
-          writeSSE("response.output_text.done", {
-            item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0, text: state.emittedText
-          });
-          writeSSE("response.content_part.done", {
-            item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0,
-            part: { type: "output_text", text: state.emittedText }
-          });
-          writeSSE("response.output_item.done", {
-            output_index: outIdx,
-            item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.emittedText }] }
-          });
-        }
+        emitReasoningDone(writeSSE, state);
+        emitMessageDone(writeSSE, state, state.emittedText, textOutputBaseIdx());
 
         if (state.toolCallDetected) {
           const toolCalls = filterToolCalls(extractToolCalls(state.toolCallBuffer), requestOptions.tools);
+          state.toolCalls = toolCalls;
           if (toolCalls) {
             let fcIdx = textOutputBaseIdx() + (state.messageItemId ? 1 : 0);
             for (const tc of toolCalls) {
@@ -382,22 +404,7 @@ export async function streamResponsesResult({ response, account, body, deleteAft
             }
           } else {
             emitTextChunk(state.toolCallBuffer);
-            if (state.messageItemId) {
-              const outIdx = textOutputBaseIdx();
-              writeSSE("response.output_text.done", {
-                item_id: state.messageItemId,
-                output_index: outIdx, content_index: 0, text: state.toolCallBuffer
-              });
-              writeSSE("response.content_part.done", {
-                item_id: state.messageItemId,
-                output_index: outIdx, content_index: 0,
-                part: { type: "output_text", text: state.toolCallBuffer }
-              });
-              writeSSE("response.output_item.done", {
-                output_index: outIdx,
-                item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.toolCallBuffer }] }
-              });
-            }
+            emitMessageDone(writeSSE, state, state.toolCallBuffer, textOutputBaseIdx());
           }
         }
       } else {
@@ -438,38 +445,18 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           state.emittedText += tagged.text;
         });
 
-        if (state.reasoningItemId) {
-          writeSSE("response.reasoning_text.done", {
-            item_id: state.reasoningItemId,
-            output_index: 0, text: state.reasoningAccumulator
-          });
-          writeSSE("response.output_item.done", {
-            output_index: 0,
-            item: { type: "reasoning", id: state.reasoningItemId, summary: [{ type: "summary_text", text: state.reasoningAccumulator }] }
-          });
-        }
-
-        if (state.messageItemId) {
-          const outIdx = textOutputBaseIdx();
-          writeSSE("response.output_text.done", {
-            item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0, text: state.emittedText
-          });
-          writeSSE("response.content_part.done", {
-            item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0,
-            part: { type: "output_text", text: state.emittedText }
-          });
-          writeSSE("response.output_item.done", {
-            output_index: outIdx,
-            item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.emittedText }] }
-          });
-        }
+        emitReasoningDone(writeSSE, state);
+        emitMessageDone(writeSSE, state, state.emittedText, textOutputBaseIdx());
       }
 
       const output = [];
       if (state.reasoningAccumulator) {
         output.push(formatReasoningItem(state.reasoningAccumulator));
+      }
+      if (state.toolCalls) {
+        for (const tc of state.toolCalls) {
+          output.push(formatFunctionCallItem(tc));
+        }
       }
       if (state.messageItemId) {
         output.push(formatMessageItem(state.emittedText));

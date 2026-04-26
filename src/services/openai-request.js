@@ -7,7 +7,11 @@ const BASE_OPENAI_MODELS = Object.freeze([
   Object.freeze({ id: "deepseek-chat-fast", modelType: "default", thinkingEnabled: false }),
   Object.freeze({ id: "deepseek-reasoner-fast", modelType: "default", thinkingEnabled: true }),
   Object.freeze({ id: "deepseek-chat-expert", modelType: "expert", thinkingEnabled: false }),
-  Object.freeze({ id: "deepseek-reasoner-expert", modelType: "expert", thinkingEnabled: true })
+  Object.freeze({ id: "deepseek-reasoner-expert", modelType: "expert", thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-v4-flash", modelType: "default", thinkingEnabled: false }),
+  Object.freeze({ id: "deepseek-v4-reasoner-flash", modelType: "default", thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-v4-pro", modelType: "expert", thinkingEnabled: false }),
+  Object.freeze({ id: "deepseek-v4-reasoner-pro", modelType: "expert", thinkingEnabled: true })
 ]);
 
 function createModelVariant(baseModel, searchEnabled) {

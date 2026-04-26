@@ -193,24 +193,30 @@ export async function collectResponsesResult({ account, body, deleteAfterFinish 
   });
 }
 
-function writeSSE(response, event, data) {
-  response.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+function createSseWriter(response) {
+  let seq = 0;
+  return function writeSSE(event, data) {
+    const payload = { type: event, sequence_number: seq++, ...data };
+    response.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`);
+  };
 }
 
-function emitResponseTextChunk(response, outIdx, text, state) {
+function emitResponseTextChunk(writeSSE, outIdx, text, state) {
   if (!state.messageItemId) {
     state.messageItemId = `msg_${randomUUID()}`;
-    writeSSE(response, "response.output_item.added", {
+    writeSSE("response.output_item.added", {
       output_index: outIdx,
       item: { id: state.messageItemId, type: "message", role: "assistant", content: [] }
     });
-    writeSSE(response, "response.content_part.added", {
+    writeSSE("response.content_part.added", {
+      item_id: state.messageItemId,
       output_index: outIdx,
       content_index: 0,
       part: { type: "output_text", text: "" }
     });
   }
-  writeSSE(response, "response.output_text.delta", {
+  writeSSE("response.output_text.delta", {
+    item_id: state.messageItemId,
     output_index: outIdx,
     content_index: 0,
     delta: text
@@ -244,8 +250,11 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         status: "in_progress", model: modelId, output: [],
         usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
       };
-      writeSSE(response, "response.created", baseResponse);
-      writeSSE(response, "response.in_progress", baseResponse);
+
+      const writeSSE = createSseWriter(response);
+
+      writeSSE("response.created", { response: baseResponse });
+      writeSSE("response.in_progress", { response: baseResponse });
 
       const state = {
         reasoningItemId: null,
@@ -259,7 +268,7 @@ export async function streamResponsesResult({ response, account, body, deleteAft
       const textOutputBaseIdx = () => state.reasoningItemId ? 1 : 0;
 
       function emitTextChunk(text) {
-        emitResponseTextChunk(response, textOutputBaseIdx(), text, state);
+        emitResponseTextChunk(writeSSE, textOutputBaseIdx(), text, state);
       }
 
       if (requestOptions.tools) {
@@ -267,12 +276,13 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           if (tagged.kind === "thinking") {
             if (!state.reasoningItemId) {
               state.reasoningItemId = `rs_${randomUUID()}`;
-              writeSSE(response, "response.output_item.added", {
+              writeSSE("response.output_item.added", {
                 output_index: 0,
                 item: { type: "reasoning", id: state.reasoningItemId, summary: [] }
               });
             }
-            writeSSE(response, "response.reasoning_text.delta", {
+            writeSSE("response.reasoning_text.delta", {
+              item_id: state.reasoningItemId,
               output_index: 0, delta: tagged.text
             });
             state.reasoningAccumulator += tagged.text;
@@ -320,10 +330,11 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         }
 
         if (state.reasoningItemId) {
-          writeSSE(response, "response.reasoning_text.done", {
+          writeSSE("response.reasoning_text.done", {
+            item_id: state.reasoningItemId,
             output_index: 0, text: state.reasoningAccumulator
           });
-          writeSSE(response, "response.output_item.done", {
+          writeSSE("response.output_item.done", {
             output_index: 0,
             item: { type: "reasoning", id: state.reasoningItemId, summary: [{ type: "summary_text", text: state.reasoningAccumulator }] }
           });
@@ -331,14 +342,16 @@ export async function streamResponsesResult({ response, account, body, deleteAft
 
         if (state.messageItemId) {
           const outIdx = textOutputBaseIdx();
-          writeSSE(response, "response.output_text.done", {
+          writeSSE("response.output_text.done", {
+            item_id: state.messageItemId,
             output_index: outIdx, content_index: 0, text: state.textAccumulator
           });
-          writeSSE(response, "response.content_part.done", {
+          writeSSE("response.content_part.done", {
+            item_id: state.messageItemId,
             output_index: outIdx, content_index: 0,
             part: { type: "output_text", text: state.textAccumulator }
           });
-          writeSSE(response, "response.output_item.done", {
+          writeSSE("response.output_item.done", {
             output_index: outIdx,
             item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.textAccumulator }] }
           });
@@ -350,17 +363,17 @@ export async function streamResponsesResult({ response, account, body, deleteAft
             let fcIdx = textOutputBaseIdx() + (state.messageItemId ? 1 : 0);
             for (const tc of toolCalls) {
               const fcId = `fc_${randomUUID()}`;
-              writeSSE(response, "response.output_item.added", {
+              writeSSE("response.output_item.added", {
                 output_index: fcIdx,
                 item: { type: "function_call", id: fcId, call_id: tc.id, name: tc.function.name }
               });
-              writeSSE(response, "response.function_call_arguments.delta", {
+              writeSSE("response.function_call_arguments.delta", {
                 output_index: fcIdx, item_id: fcId, delta: tc.function.arguments
               });
-              writeSSE(response, "response.function_call_arguments.done", {
+              writeSSE("response.function_call_arguments.done", {
                 output_index: fcIdx, item_id: fcId, arguments: tc.function.arguments
               });
-              writeSSE(response, "response.output_item.done", {
+              writeSSE("response.output_item.done", {
                 output_index: fcIdx,
                 item: { type: "function_call", id: fcId, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments }
               });
@@ -370,14 +383,16 @@ export async function streamResponsesResult({ response, account, body, deleteAft
             emitTextChunk(state.toolCallBuffer);
             if (state.messageItemId) {
               const outIdx = textOutputBaseIdx();
-              writeSSE(response, "response.output_text.done", {
+              writeSSE("response.output_text.done", {
+                item_id: state.messageItemId,
                 output_index: outIdx, content_index: 0, text: state.toolCallBuffer
               });
-              writeSSE(response, "response.content_part.done", {
+              writeSSE("response.content_part.done", {
+                item_id: state.messageItemId,
                 output_index: outIdx, content_index: 0,
                 part: { type: "output_text", text: state.toolCallBuffer }
               });
-              writeSSE(response, "response.output_item.done", {
+              writeSSE("response.output_item.done", {
                 output_index: outIdx,
                 item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.toolCallBuffer }] }
               });
@@ -389,12 +404,13 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           if (tagged.kind === "thinking") {
             if (!state.reasoningItemId) {
               state.reasoningItemId = `rs_${randomUUID()}`;
-              writeSSE(response, "response.output_item.added", {
+              writeSSE("response.output_item.added", {
                 output_index: 0,
                 item: { type: "reasoning", id: state.reasoningItemId, summary: [] }
               });
             }
-            writeSSE(response, "response.reasoning_text.delta", {
+            writeSSE("response.reasoning_text.delta", {
+              item_id: state.reasoningItemId,
               output_index: 0, delta: tagged.text
             });
             state.reasoningAccumulator += tagged.text;
@@ -404,26 +420,29 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           const outIdx = textOutputBaseIdx();
           if (!state.messageItemId) {
             state.messageItemId = `msg_${randomUUID()}`;
-            writeSSE(response, "response.output_item.added", {
+            writeSSE("response.output_item.added", {
               output_index: outIdx,
               item: { id: state.messageItemId, type: "message", role: "assistant", content: [] }
             });
-            writeSSE(response, "response.content_part.added", {
+            writeSSE("response.content_part.added", {
+              item_id: state.messageItemId,
               output_index: outIdx, content_index: 0,
               part: { type: "output_text", text: "" }
             });
           }
-          writeSSE(response, "response.output_text.delta", {
+          writeSSE("response.output_text.delta", {
+            item_id: state.messageItemId,
             output_index: outIdx, content_index: 0, delta: tagged.text
           });
           state.textAccumulator += tagged.text;
         });
 
         if (state.reasoningItemId) {
-          writeSSE(response, "response.reasoning_text.done", {
+          writeSSE("response.reasoning_text.done", {
+            item_id: state.reasoningItemId,
             output_index: 0, text: state.reasoningAccumulator
           });
-          writeSSE(response, "response.output_item.done", {
+          writeSSE("response.output_item.done", {
             output_index: 0,
             item: { type: "reasoning", id: state.reasoningItemId, summary: [{ type: "summary_text", text: state.reasoningAccumulator }] }
           });
@@ -431,25 +450,29 @@ export async function streamResponsesResult({ response, account, body, deleteAft
 
         if (state.messageItemId) {
           const outIdx = textOutputBaseIdx();
-          writeSSE(response, "response.output_text.done", {
+          writeSSE("response.output_text.done", {
+            item_id: state.messageItemId,
             output_index: outIdx, content_index: 0, text: state.textAccumulator
           });
-          writeSSE(response, "response.content_part.done", {
+          writeSSE("response.content_part.done", {
+            item_id: state.messageItemId,
             output_index: outIdx, content_index: 0,
             part: { type: "output_text", text: state.textAccumulator }
           });
-          writeSSE(response, "response.output_item.done", {
+          writeSSE("response.output_item.done", {
             output_index: outIdx,
             item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.textAccumulator }] }
           });
         }
       }
 
-      writeSSE(response, "response.completed", {
-        id: responseId, object: "response", created_at: created,
-        status: "completed", completed_at: Math.floor(Date.now() / 1000),
-        model: modelId, output: [],
-        usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+      writeSSE("response.completed", {
+        response: {
+          id: responseId, object: "response", created_at: created,
+          status: "completed", completed_at: Math.floor(Date.now() / 1000),
+          model: modelId, output: [],
+          usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+        }
       });
 
       response.end();

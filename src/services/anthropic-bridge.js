@@ -281,6 +281,9 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
           }
 
           const text = tagged.text;
+          if (reasoningBlockOpen) {
+            closeThinkingBlock();
+          }
           if (toolCallDetected) {
             toolCallBuffer += text;
             return;
@@ -387,6 +390,10 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
             });
             reasoningAccumulator += tagged.text;
             return;
+          }
+
+          if (reasoningBlockOpen) {
+            closeThinkingBlock();
           }
 
           startTextBlock();

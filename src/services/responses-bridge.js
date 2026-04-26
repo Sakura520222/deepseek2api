@@ -221,7 +221,7 @@ function emitResponseTextChunk(writeSSE, outIdx, text, state) {
     content_index: 0,
     delta: text
   });
-  state.textAccumulator += text;
+  state.emittedText += text;
 }
 
 export async function streamResponsesResult({ response, account, body, deleteAfterFinish }) {
@@ -260,6 +260,7 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         reasoningItemId: null,
         messageItemId: null,
         textAccumulator: "",
+        emittedText: "",
         reasoningAccumulator: "",
         toolCallDetected: false,
         toolCallBuffer: ""
@@ -344,16 +345,16 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           const outIdx = textOutputBaseIdx();
           writeSSE("response.output_text.done", {
             item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0, text: state.textAccumulator
+            output_index: outIdx, content_index: 0, text: state.emittedText
           });
           writeSSE("response.content_part.done", {
             item_id: state.messageItemId,
             output_index: outIdx, content_index: 0,
-            part: { type: "output_text", text: state.textAccumulator }
+            part: { type: "output_text", text: state.emittedText }
           });
           writeSSE("response.output_item.done", {
             output_index: outIdx,
-            item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.textAccumulator }] }
+            item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.emittedText }] }
           });
         }
 
@@ -434,7 +435,7 @@ export async function streamResponsesResult({ response, account, body, deleteAft
             item_id: state.messageItemId,
             output_index: outIdx, content_index: 0, delta: tagged.text
           });
-          state.textAccumulator += tagged.text;
+          state.emittedText += tagged.text;
         });
 
         if (state.reasoningItemId) {
@@ -452,25 +453,33 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           const outIdx = textOutputBaseIdx();
           writeSSE("response.output_text.done", {
             item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0, text: state.textAccumulator
+            output_index: outIdx, content_index: 0, text: state.emittedText
           });
           writeSSE("response.content_part.done", {
             item_id: state.messageItemId,
             output_index: outIdx, content_index: 0,
-            part: { type: "output_text", text: state.textAccumulator }
+            part: { type: "output_text", text: state.emittedText }
           });
           writeSSE("response.output_item.done", {
             output_index: outIdx,
-            item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.textAccumulator }] }
+            item: { type: "message", id: state.messageItemId, role: "assistant", content: [{ type: "output_text", text: state.emittedText }] }
           });
         }
+      }
+
+      const output = [];
+      if (state.reasoningAccumulator) {
+        output.push(formatReasoningItem(state.reasoningAccumulator));
+      }
+      if (state.messageItemId) {
+        output.push(formatMessageItem(state.emittedText));
       }
 
       writeSSE("response.completed", {
         response: {
           id: responseId, object: "response", created_at: created,
           status: "completed", completed_at: Math.floor(Date.now() / 1000),
-          model: modelId, output: [],
+          model: modelId, output,
           usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
         }
       });

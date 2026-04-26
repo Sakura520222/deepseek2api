@@ -1,5 +1,3 @@
-import { getApiKeyRecord } from "../services/api-key-service.js";
-import { takeRoundRobinAccount } from "../services/account-rotation-service.js";
 import { resolveScopedAccount, resolveSession } from "../services/auth-service.js";
 import { deleteChatSession } from "../services/chat-session-service.js";
 import {
@@ -8,9 +6,7 @@ import {
   sanitizeChatCompletionBody
 } from "../services/deepseek-chat-response.js";
 import { isIncognitoEnabledForOwner } from "../services/incognito-service.js";
-import { collectOpenAiResponse, streamOpenAiResponse } from "../services/openai-bridge.js";
 import { proxyDeepseekRequest } from "../services/deepseek-proxy.js";
-import { listOpenAiModels } from "../services/openai-request.js";
 import { withOwnerRequestLimit } from "../services/request-limit-service.js";
 import { parseJsonBody, readRequestBody, sendError, sendJson } from "../utils/http.js";
 
@@ -40,11 +36,6 @@ function getResponseHeaders(upstream) {
   delete headers["keep-alive"];
   delete headers["transfer-encoding"];
   return headers;
-}
-
-function getBearerToken(request) {
-  const value = request.headers.authorization ?? "";
-  return value.startsWith("Bearer ") ? value.slice(7) : "";
 }
 
 function tryParseChatCompletionBody(body) {
@@ -105,29 +96,6 @@ async function writeUpstreamResponse({ onAfterStream, response, upstream }) {
 
   await onAfterStream?.();
   response.end();
-}
-
-function resolveLimitStatus(error) {
-  return error.code === "USER_DISABLED" ? 403 : 429;
-}
-
-function handleOpenAiError(response, error) {
-  if (error.code === "USER_DISABLED" || error.code === "REQUEST_LIMIT") {
-    sendError(response, resolveLimitStatus(error), error.message);
-    return true;
-  }
-
-  if (error instanceof SyntaxError) {
-    sendError(response, 400, "Invalid JSON body");
-    return true;
-  }
-
-  if (error.statusCode) {
-    sendError(response, error.statusCode, error.message);
-    return true;
-  }
-
-  return false;
 }
 
 export async function handleProxyRequest(request, response, url, allowedProxyPaths) {
@@ -204,74 +172,9 @@ export async function handleProxyRequest(request, response, url, allowedProxyPat
       throw error;
     }
 
-    sendError(response, resolveLimitStatus(error), error.message);
+    const status = error.code === "USER_DISABLED" ? 403 : 429;
+    sendError(response, status, error.message);
   }
 
   return true;
-}
-
-export async function handleOpenAiRequest(request, response, url) {
-  const apiKey = getBearerToken(request);
-  const apiKeyRecord = apiKey ? getApiKeyRecord(apiKey) : null;
-
-  if (!apiKeyRecord) {
-    sendError(response, 401, "Invalid API key");
-    return true;
-  }
-
-  if (request.method === "GET" && url.pathname === "/v1/models") {
-    try {
-      await withOwnerRequestLimit(apiKeyRecord.ownerId, async () => {
-        sendJson(response, 200, {
-          object: "list",
-          data: listOpenAiModels()
-        });
-      });
-    } catch (error) {
-      if (!handleOpenAiError(response, error)) {
-        throw error;
-      }
-    }
-
-    return true;
-  }
-
-  if (request.method === "POST" && url.pathname === "/v1/chat/completions") {
-    try {
-      await withOwnerRequestLimit(apiKeyRecord.ownerId, async () => {
-        const body = parseJsonBody(await readRequestBody(request));
-        const account = takeRoundRobinAccount(apiKeyRecord);
-        if (!account) {
-          sendError(response, 404, "Account not found");
-          return;
-        }
-
-        const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
-        if (body.stream) {
-          await streamOpenAiResponse({
-            response,
-            account,
-            body,
-            deleteAfterFinish
-          });
-          return;
-        }
-
-        const payload = await collectOpenAiResponse({
-          account,
-          body,
-          deleteAfterFinish
-        });
-        sendJson(response, 200, payload);
-      });
-    } catch (error) {
-      if (!handleOpenAiError(response, error)) {
-        throw error;
-      }
-    }
-
-    return true;
-  }
-
-  return false;
 }

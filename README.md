@@ -1,7 +1,8 @@
 # DeepSeek2API
 
-> 一个纯 Node.js 的 DeepSeek Web 控制台 + OpenAI 兼容桥接服务。  
+> 一个纯 Node.js 的 DeepSeek Web 控制台 + 多协议 API 桥接服务。
 > 把本地用户体系、DeepSeek 账号绑定、API Key 管理、原生代理调试和管理后台放进同一个可直接运行的项目里。
+> 同时支持 OpenAI、Anthropic、OpenAI Responses 三种 API 格式。
 
 ## 功能概览
 
@@ -10,7 +11,11 @@
 | 控制台 UI | 登录 / 注册、聊天工作区、历史会话、文件上传、主题切换、流式 / 非流式响应切换 |
 | DeepSeek 账号层 | 绑定多个 DeepSeek Web 账号，按管理员 / 本地用户隔离可见范围 |
 | OpenAI 兼容层 | 提供 `GET /v1/models` 和 `POST /v1/chat/completions` |
+| Anthropic 兼容层 | 提供 `POST /v1/messages`，支持 `x-api-key` 鉴权 |
+| Responses API 层 | 提供 `POST /v1/responses`，兼容 OpenAI Responses API 格式 |
+| 工具调用解析 | 自动识别多种格式的工具调用（XML 标签、代码块、纯文本标记等）并转换为标准格式 |
 | 原生代理层 | 提供 `/proxy/*` 白名单转发，便于调试和复用 DeepSeek Web 接口 |
+| 调试模式 | 可选的请求追踪与日志记录，敏感信息自动脱敏 |
 | 管理后台 | 注册开关、邀请码生成 / 删除、用户启用 / 禁用 / 删除、并发 / 速率限制 |
 | 无痕模式 | 支持全局或用户级无痕，会话完成后自动清理 |
 | 部署形态 | 无第三方 npm 运行时依赖，`npm start` 即可启动 |
@@ -22,9 +27,12 @@
 - 运行状态统一保存在 `data/app.json`
 - DeepSeek token 失效时会自动重新登录并刷新
 - 遇到 PoW 保护接口时会自动获取 wasm 并求解挑战
-- OpenAI 兼容层同时支持流式和非流式响应
+- 同时支持 OpenAI、Anthropic Messages、OpenAI Responses 三种 API 格式，均支持流式和非流式
+- 上游 DeepSeek API 错误会按各 API 格式标准正确传递给客户端
+- 工具调用解析支持 `<tool_call`、`<tool_code`、`<invoke`、`<function_call`、`[Called tool:`、代码块等多种格式
 - `deepseek-reasoner-*` 模型会把思维内容包裹在 `<think>...</think>`
 - API Key 请求会在当前用户可见账号之间轮询，提高多账号利用率
+- 可选调试模式，记录请求全链路日志（敏感信息自动脱敏）
 
 ## 运行要求
 
@@ -65,6 +73,7 @@ Copy-Item .env.example .env
 
 ```env
 PORT=3000
+DEBUG=true
 APP_ADMIN_USERNAME=
 APP_ADMIN_PASSWORD=
 ```
@@ -83,6 +92,8 @@ APP_ADMIN_PASSWORD=
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `PORT` | `3000` | 服务监听端口 |
+| `DEBUG` | `false` | 启用调试模式，记录请求追踪日志 |
+| `TOOL_CALL_MODEL` | 空 | 工具调用使用的模型 ID，留空则使用请求原始模型 |
 | `APP_ADMIN_USERNAME` | 空 | 管理员用户名 |
 | `APP_ADMIN_PASSWORD` | 空 | 管理员密码 |
 
@@ -119,12 +130,21 @@ APP_ADMIN_PASSWORD=
 - 普通用户可以只为自己开启无痕
 - 开启后，聊天完成后会自动清理相关 DeepSeek 会话
 
-## OpenAI 兼容接口
+## API 兼容接口
 
 ### 支持的接口
 
-- `GET /v1/models`
-- `POST /v1/chat/completions`
+| 接口 | 方法 | 协议格式 |
+| --- | --- | --- |
+| `/v1/models` | GET | OpenAI |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions |
+| `/v1/responses` | POST | OpenAI Responses |
+| `/v1/messages` | POST | Anthropic Messages |
+
+### 鉴权方式
+
+- OpenAI 格式（`/v1/models`、`/v1/chat/completions`、`/v1/responses`）：`Authorization: Bearer <API_KEY>`
+- Anthropic 格式（`/v1/messages`）：`x-api-key: <API_KEY>` 或 `Authorization: Bearer <API_KEY>`
 
 ### 请求示例
 
@@ -163,6 +183,14 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 - `deepseek-chat-expert-search`
 - `deepseek-reasoner-expert`
 - `deepseek-reasoner-expert-search`
+- `deepseek-v4-flash`
+- `deepseek-v4-flash-search`
+- `deepseek-v4-reasoner-flash`
+- `deepseek-v4-reasoner-flash-search`
+- `deepseek-v4-pro`
+- `deepseek-v4-pro-search`
+- `deepseek-v4-reasoner-pro`
+- `deepseek-v4-reasoner-pro-search`
 
 </details>
 
@@ -255,12 +283,22 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 ```text
 .
 ├─ data/                  # 运行时数据目录
+├─ logs/                  # 调试日志目录（启用 DEBUG 时生成）
 ├─ public/                # 前端控制台静态资源
 ├─ src/
-│  ├─ routes/             # 公共 / 私有 / 管理 / 代理路由
+│  ├─ routes/             # 公共 / 私有 / 管理 / 代理 / v1 路由
 │  ├─ services/           # 账号、用户、桥接、PoW、限流等核心逻辑
+│  │  ├─ openai-bridge.js      # OpenAI Chat Completions 桥接
+│  │  ├─ anthropic-bridge.js   # Anthropic Messages 桥接
+│  │  ├─ responses-bridge.js   # OpenAI Responses API 桥接
+│  │  └─ completion-core.js    # 流式处理与工具调用检测公共逻辑
 │  ├─ storage/            # JSON 文件存储
-│  └─ utils/              # HTTP、SSE、ID、Prompt 等工具
+│  └─ utils/
+│     ├─ tool-prompt.js         # 工具调用多格式解析
+│     ├─ debug-logger.js        # 调试日志与请求追踪
+│     ├─ deepseek-sse.js        # DeepSeek SSE 解码器
+│     ├─ prompt.js              # 系统提示词生成
+│     └─ http.js, id.js         # HTTP、ID 工具
 ├─ .env.example
 ├─ package.json
 └─ README.md

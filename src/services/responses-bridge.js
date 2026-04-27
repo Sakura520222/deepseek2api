@@ -311,8 +311,17 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         reasoningAccumulator: "",
         toolCallDetected: false,
         toolCallBuffer: "",
-        toolCalls: null
+        toolCalls: null,
+        decidedAsText: false
       };
+
+      function checkForToolCallMarker(buf) {
+        const idx = findToolCallMarker(buf);
+        if (idx !== -1) return idx;
+        const jsonIdx = buf.indexOf('{"name"');
+        if (jsonIdx !== -1) return jsonIdx;
+        return -1;
+      }
 
       const textOutputBaseIdx = () => state.reasoningItemId ? 1 : 0;
 
@@ -344,7 +353,7 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         }
 
         state.textAccumulator += text;
-        const markerIndex = findToolCallMarker(state.textAccumulator);
+        const markerIndex = checkForToolCallMarker(state.textAccumulator);
         if (markerIndex !== -1) {
           state.toolCallDetected = true;
           state.toolCallBuffer = state.textAccumulator.slice(markerIndex);
@@ -364,17 +373,34 @@ export async function streamResponsesResult({ response, account, body, deleteAft
               if (marker.startsWith(tail)) { isPartial = true; break; }
             }
             if (tail.startsWith("```")) { isPartial = true; }
+            if (tail.startsWith('{"na')) { isPartial = true; }
             if (isPartial) { safeEnd = i; break; }
           }
         }
         const toStream = state.textAccumulator.slice(0, safeEnd);
         state.textAccumulator = state.textAccumulator.slice(safeEnd);
-        if (toStream) emitTextChunk(toStream);
+        if (toStream) {
+          state.decidedAsText = true;
+          emitTextChunk(toStream);
+        }
       });
 
       if (state.textAccumulator && !state.toolCallDetected) {
-        emitTextChunk(state.textAccumulator);
-        state.textAccumulator = "";
+        // Even after streaming text, check remaining buffer for tool calls
+        if (state.decidedAsText) {
+          const markerIdx = checkForToolCallMarker(state.textAccumulator);
+          if (markerIdx !== -1) {
+            const before = state.textAccumulator.slice(0, markerIdx);
+            if (before) emitTextChunk(before);
+            state.toolCallDetected = true;
+            state.toolCallBuffer = state.textAccumulator.slice(markerIdx);
+            state.textAccumulator = "";
+          }
+        }
+        if (state.textAccumulator && !state.toolCallDetected) {
+          emitTextChunk(state.textAccumulator);
+          state.textAccumulator = "";
+        }
       }
 
       emitReasoningDone(writeSSE, state);

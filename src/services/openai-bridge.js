@@ -195,6 +195,34 @@ export async function streamOpenAiResponse(options) {
       let toolCallDetected = false;
       let toolCallBuffer = "";
       let textBuffer = "";
+      let decidedAsText = false;
+
+      function checkForToolCallMarker(buf) {
+        // Check known markers
+        const idx = findToolCallMarker(buf);
+        if (idx !== -1) return idx;
+        // Check bare JSON: {"name":
+        const jsonIdx = buf.indexOf('{"name"');
+        if (jsonIdx !== -1) return jsonIdx;
+        return -1;
+      }
+
+      function trySwitchToToolCall() {
+        const markerIdx = checkForToolCallMarker(textBuffer);
+        if (markerIdx !== -1) {
+          const before = textBuffer.slice(0, markerIdx);
+          if (before) {
+            response.write(
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
+            );
+          }
+          toolCallDetected = true;
+          toolCallBuffer = textBuffer.slice(markerIdx);
+          textBuffer = "";
+          return true;
+        }
+        return false;
+      }
 
       await consumeTaggedStream(deepseekResponse.body, (tagged) => {
         if (tagged.kind === "thinking") {
@@ -213,20 +241,10 @@ export async function streamOpenAiResponse(options) {
 
         textBuffer += text;
 
-        const markerIndex = findToolCallMarker(textBuffer);
-        if (markerIndex !== -1) {
-          toolCallDetected = true;
-          const before = textBuffer.slice(0, markerIndex);
-          if (before) {
-            response.write(
-              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
-            );
-          }
-          toolCallBuffer = textBuffer.slice(markerIndex);
-          textBuffer = "";
-          return;
-        }
+        // Check for tool call markers
+        if (trySwitchToToolCall()) return;
 
+        // Partial marker check — hold back tail that might be start of a marker
         let safeEnd = textBuffer.length;
         if (isPartialMarker(textBuffer)) {
           for (let i = Math.max(0, textBuffer.length - 20); i < textBuffer.length; i++) {
@@ -237,6 +255,7 @@ export async function streamOpenAiResponse(options) {
               if (marker.startsWith(tail)) { isPartial = true; break; }
             }
             if (tail.startsWith("```")) { isPartial = true; }
+            if (tail.startsWith('{"na')) { isPartial = true; }
             if (isPartial) { safeEnd = i; break; }
           }
         }
@@ -245,16 +264,35 @@ export async function streamOpenAiResponse(options) {
         textBuffer = textBuffer.slice(safeEnd);
 
         if (toStream) {
+          decidedAsText = true;
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toStream }))}\n\n`
           );
         }
       });
 
+      // Final check: even if decided as text, scan for markers in remaining buffer
       if (textBuffer && !toolCallDetected) {
-        response.write(
-          `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: textBuffer }))}\n\n`
-        );
+        if (!decidedAsText || checkForToolCallMarker(textBuffer) !== -1) {
+          // Not yet decided, or found a marker — try tool call extraction
+          if (!decidedAsText) {
+            const rawToolCalls = extractToolCalls(textBuffer);
+            if (rawToolCalls) {
+              toolCallDetected = true;
+              toolCallBuffer = textBuffer;
+              textBuffer = "";
+            }
+          } else {
+            if (trySwitchToToolCall()) {
+              // switched
+            }
+          }
+        }
+        if (textBuffer && !toolCallDetected) {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: textBuffer }))}\n\n`
+          );
+        }
       }
 
       if (toolCallDetected) {

@@ -228,6 +228,15 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       let textAccumulator = "";
       let toolCallDetected = false;
       let toolCallBuffer = "";
+      let decidedAsText = false;
+
+      function checkForToolCallMarker(buf) {
+        const idx = findToolCallMarker(buf);
+        if (idx !== -1) return idx;
+        const jsonIdx = buf.indexOf('{"name"');
+        if (jsonIdx !== -1) return jsonIdx;
+        return -1;
+      }
       let hasToolCalls = false;
 
       function startThinkingBlock() {
@@ -289,7 +298,7 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
         }
 
         textAccumulator += text;
-        const markerIndex = findToolCallMarker(textAccumulator);
+        const markerIndex = checkForToolCallMarker(textAccumulator);
         if (markerIndex !== -1) {
           toolCallDetected = true;
           toolCallBuffer = textAccumulator.slice(markerIndex);
@@ -316,6 +325,7 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
               if (marker.startsWith(tail)) { isPartial = true; break; }
             }
             if (tail.startsWith("```")) { isPartial = true; }
+            if (tail.startsWith('{"na')) { isPartial = true; }
             if (isPartial) { safeEnd = i; break; }
           }
         }
@@ -323,6 +333,7 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
         textAccumulator = textAccumulator.slice(safeEnd);
 
         if (toStream) {
+          decidedAsText = true;
           startTextBlock();
           writeSSE(response, "content_block_delta", {
             type: "content_block_delta",
@@ -333,13 +344,32 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       });
 
       if (textAccumulator && !toolCallDetected) {
-        startTextBlock();
-        writeSSE(response, "content_block_delta", {
-          type: "content_block_delta",
-          index: blockIndex,
-          delta: { type: "text_delta", text: textAccumulator }
-        });
-        textAccumulator = "";
+        // Even after streaming text, check if remaining buffer contains a tool call
+        if (decidedAsText) {
+          const markerIdx = checkForToolCallMarker(textAccumulator);
+          if (markerIdx !== -1) {
+            const before = textAccumulator.slice(0, markerIdx);
+            if (before) {
+              startTextBlock();
+              writeSSE(response, "content_block_delta", {
+                type: "content_block_delta", index: blockIndex,
+                delta: { type: "text_delta", text: before }
+              });
+            }
+            toolCallDetected = true;
+            toolCallBuffer = textAccumulator.slice(markerIdx);
+            textAccumulator = "";
+          }
+        }
+        if (textAccumulator && !toolCallDetected) {
+          startTextBlock();
+          writeSSE(response, "content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "text_delta", text: textAccumulator }
+          });
+          textAccumulator = "";
+        }
       }
 
       closeThinkingBlock();

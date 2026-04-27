@@ -6,6 +6,8 @@ import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 
 export const TOOL_CALL_MARKERS = ["<tool_call", "<function_call", "<tool_code", "<invoke", "<parameter", "[调用 Agent]", "[Called tool:"];
 
+const JSON_TOOL_CALL_HINT = '{"name"';
+
 export const MARKER_START_CHARS = [...new Set(["<", "`", ...TOOL_CALL_MARKERS.map(m => m[0])])];
 
 export function findToolCallMarker(text) {
@@ -19,10 +21,11 @@ export function findToolCallMarker(text) {
   return earliest;
 }
 
+/** Like findToolCallMarker but also detects bare JSON tool calls like {"name":"..."}. */
 export function checkForToolCallMarker(buf) {
   const idx = findToolCallMarker(buf);
   if (idx !== -1) return idx;
-  const jsonIdx = buf.indexOf('{"name"');
+  const jsonIdx = buf.indexOf(JSON_TOOL_CALL_HINT);
   if (jsonIdx !== -1) return jsonIdx;
   return -1;
 }

@@ -99,6 +99,7 @@ function extractFragmentText(payload) {
     return payload.v;
   }
 
+  // At this point payload.v is not a string (all string cases handled above).
   // Nested content patterns for v4/expert models: v.content, v.text, v.delta
   if (payload.v && typeof payload.v === "object") {
     if (typeof payload.v.content === "string") return payload.v.content;
@@ -123,10 +124,10 @@ export function createDeepseekDeltaDecoder() {
       currentKind = resolveCurrentKind(payload, currentKind);
       const text = extractFragmentText(payload);
 
-      // DeepSeek signal frame: bare "FINISHED" string in a payload without fragment structure.
-      // Only filter when the payload is clearly a termination signal (no fragment-related keys),
-      // so that normal text responses containing "FINISHED" are not swallowed.
-      if (text === "FINISHED" && !("p" in payload) && !payload.v?.response?.fragments) {
+      // DeepSeek signal frame: bare "FINISHED" in a payload with no fragment path.
+      // Only filter when there's no "p" key — payloads with a "p" key are actual
+      // content deltas that happen to contain the word "FINISHED".
+      if (text === "FINISHED" && !("p" in payload) && typeof payload.v === "string") {
         return null;
       }
 

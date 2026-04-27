@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 const TOOL_CALL_PREFIX = "<tool_call";
 const TOOL_CALLS_PREFIX = "<tool_calls";
+const TOOL_CODE_PREFIX = "<tool_code";
 const FUNCTION_CALL_PREFIX = "<function_call";
 const AGENT_CALL_PREFIX = "[调用 Agent]";
 const PARAMETER_PREFIX = "<parameter";
@@ -83,7 +84,7 @@ function parseInlineFormat(text, markerIndex) {
   }
 }
 
-// Strategy 2: <tool_call name="...">{...}
+// Strategy 2: <tool_call name="...">{...} or <tool_call name="arguments": {...}>
 function parseAttrFormat(text, markerIndex) {
   const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
   const rest = text.slice(afterPrefix);
@@ -92,6 +93,29 @@ function parseAttrFormat(text, markerIndex) {
   if (!nameMatch) return null;
 
   const afterAttr = afterPrefix + nameMatch[0].length;
+  const afterRest = text.slice(afterAttr);
+
+  // Variant: <tool_call name="arguments": {"command": "...", "timeout": 15}}
+  // No > separator, just colon + JSON
+  const colonMatch = afterRest.match(/^\s*:\s*/);
+  if (colonMatch) {
+    const jsonStart = afterAttr + colonMatch[0].length;
+    const jsonResult = parseJsonFrom(text, jsonStart);
+    if (jsonResult) {
+      try {
+        const parsed = JSON.parse(jsonResult.json);
+        // Use "command" value prefix as tool name hint, or fall back to "shell"
+        const toolName = parsed.command
+          ? parsed.command.trimStart().split(/\s+/)[0].replace(/\.exe$/i, "")
+          : "shell";
+        // If the first word looks like a variable/flag, fall back to "shell"
+        const resolved = toolName.match(/^[\$\-@]/) ? "shell" : toolName;
+        return { toolCalls: [makeToolCall(resolved, parsed)], endIndex: jsonResult.endIndex };
+      } catch { /* fall through */ }
+    }
+  }
+
+  // Standard variant: <tool_call name="...">{...}
   const gtIndex = text.indexOf(">", afterAttr);
   if (gtIndex === -1) return null;
 
@@ -449,6 +473,43 @@ function parseToolCallsWrapper(text, markerIndex) {
   return null;
 }
 
+// Strategy: <tool_code>{"command": "...", "timeout": N}</tool_code>
+function parseToolCodeWrapper(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CODE_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  const gtMatch = rest.match(/^\s*>/);
+  if (!gtMatch) return null;
+
+  const contentStart = afterPrefix + gtMatch[0].length;
+  const closeTag = "</tool_code>";
+  const closeIdx = text.indexOf(closeTag, contentStart);
+  if (closeIdx === -1) return null;
+
+  const body = text.slice(contentStart, closeIdx).trim();
+
+  // Try JSON with command field → shell tool
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed.command) {
+      const toolName = parsed.command.trimStart().split(/\s+/)[0].replace(/\.exe$/i, "");
+      const resolved = toolName.match(/^[\$\-@]/) ? "shell" : toolName;
+      return { toolCalls: [makeToolCall(resolved, parsed)], endIndex: closeIdx + closeTag.length };
+    }
+    if (parsed.name) {
+      return { toolCalls: [makeToolCall(parsed.name, parsed.arguments)], endIndex: closeIdx + closeTag.length };
+    }
+  } catch { /* not JSON */ }
+
+  // Try delegating to extractToolCalls for inner content
+  const innerCalls = extractToolCalls(body);
+  if (innerCalls && innerCalls.length > 0) {
+    return { toolCalls: innerCalls, endIndex: closeIdx + closeTag.length };
+  }
+
+  return null;
+}
+
 // Strategy: <parameter name="query" tool="web_search">value</parameter>
 // OpenClaw format: multiple <parameter> tags with tool/tool_name attr aggregate into one call
 function parseParameterTags(text, markerIndex) {
@@ -522,6 +583,7 @@ function parseParameterTags(text, markerIndex) {
 const MARKER_STRATEGIES = [
   { prefix: TOOL_CALL_PREFIX, parsers: [parseToolCallWrapper, parseSelfClosingAttr, parseInlineFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
   { prefix: TOOL_CALLS_PREFIX, parsers: [parseToolCallsWrapper] },
+  { prefix: TOOL_CODE_PREFIX, parsers: [parseToolCodeWrapper] },
   { prefix: FUNCTION_CALL_PREFIX, parsers: [parseFunctionCallXml, parseXmlParamFormat] },
   { prefix: PARAMETER_PREFIX, parsers: [parseParameterTags] },
   { prefix: AGENT_CALL_PREFIX, parsers: [parseAgentCallFormat] },
@@ -570,7 +632,7 @@ export function extractToolCalls(text) {
   }
 
   // Last resort: try to find standalone JSON objects with "name" + "arguments"
-  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
+  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(TOOL_CODE_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
     JSON_OBJECT_RE.lastIndex = 0;
     let match;
     while ((match = JSON_OBJECT_RE.exec(text)) !== null) {

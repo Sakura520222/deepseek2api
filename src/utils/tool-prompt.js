@@ -65,6 +65,30 @@ function makeToolCall(name, args) {
 
 // --- Parsing strategies (ordered by priority) ---
 
+// Strategy: <tool_call BODY </tool_call  — XML tag wrapping JSON body
+function parseXmlBodyFormat(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+  const gtMatch = rest.match(/^\s*>/);
+  if (!gtMatch) return null;
+
+  const bodyStart = afterPrefix + gtMatch[0].length;
+  const closeTag = "</tool_call";
+  const closeIdx = text.indexOf(closeTag, bodyStart);
+  const end = closeIdx !== -1 ? text.indexOf(">", closeIdx) + 1 : text.length;
+  const body = text.slice(bodyStart, closeIdx !== -1 ? closeIdx : text.length).trim();
+
+  try {
+    const parsed = JSON.parse(body);
+    if (parsed.name) return { toolCalls: [makeToolCall(parsed.name, parsed.arguments)], endIndex: end };
+  } catch { /* not JSON */ }
+
+  const innerCalls = extractToolCalls(body);
+  if (innerCalls?.length) return { toolCalls: innerCalls, endIndex: end };
+
+  return null;
+}
+
 // Strategy 1: <tool_call={"name": "...", "arguments": {...}}>
 function parseInlineFormat(text, markerIndex) {
   const eqIndex = markerIndex + TOOL_CALL_PREFIX.length;
@@ -782,7 +806,7 @@ function parseParameterTags(text, markerIndex) {
 // --- Marker-based strategies dispatcher ---
 
 const MARKER_STRATEGIES = [
-  { prefix: TOOL_CALL_PREFIX, parsers: [parseToolCallWrapper, parseSelfClosingAttr, parseInlineFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
+  { prefix: TOOL_CALL_PREFIX, parsers: [parseToolCallWrapper, parseSelfClosingAttr, parseInlineFormat, parseXmlBodyFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
   { prefix: TOOL_CALLS_PREFIX, parsers: [parseToolCallsWrapper] },
   { prefix: TOOL_CODE_PREFIX, parsers: [parseToolCodeWrapper] },
   { prefix: INVOKE_PREFIX, parsers: [parseInvokeWrapper] },

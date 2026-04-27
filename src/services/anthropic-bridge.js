@@ -232,6 +232,7 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       let toolCallBuffer = "";
       let decidedAsText = false;
       let hasToolCalls = false;
+      let upstreamError = null;
 
       function startThinkingBlock() {
         if (reasoningBlockOpen) return;
@@ -272,6 +273,12 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       }
 
       await consumeTaggedStream(dsResponse.body, (tagged) => {
+        if (tagged.kind === "error") {
+          upstreamError = tagged;
+          return;
+        }
+        if (upstreamError) return;
+
         if (tagged.kind === "thinking") {
           startThinkingBlock();
           writeSSE(response, "content_block_delta", {
@@ -342,6 +349,16 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
           });
         }
       }, debugCtx);
+
+      if (upstreamError) {
+        debugCtx?.logFinalResponse({ error: upstreamError.text, code: upstreamError.code });
+        writeSSE(response, "error", {
+          type: "error",
+          error: { type: "api_error", message: upstreamError.text }
+        });
+        response.end();
+        return;
+      }
 
       if (textAccumulator && !toolCallDetected) {
         if (decidedAsText) {

@@ -199,6 +199,7 @@ export async function streamOpenAiResponse(options) {
       let toolCallBuffer = "";
       let textBuffer = "";
       let decidedAsText = false;
+      let upstreamError = null;
 
       function trySwitchToToolCall() {
         const markerIdx = checkForToolCallMarker(textBuffer);
@@ -224,6 +225,12 @@ export async function streamOpenAiResponse(options) {
       }
 
       await consumeTaggedStream(deepseekResponse.body, (tagged) => {
+        if (tagged.kind === "error") {
+          upstreamError = tagged;
+          return;
+        }
+        if (upstreamError) return;
+
         if (tagged.kind === "thinking") {
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { reasoning_content: tagged.text }))}\n\n`
@@ -267,6 +274,18 @@ export async function streamOpenAiResponse(options) {
           );
         }
       }, debugCtx);
+
+      if (upstreamError) {
+        debugCtx?.logFinalResponse({ error: upstreamError.text, code: upstreamError.code });
+        response.write(
+          `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: `[Error: ${upstreamError.text}]` }))}\n\n`
+        );
+        response.write(
+          `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+        );
+        response.end("data: [DONE]\n\n");
+        return;
+      }
 
       if (textBuffer && !toolCallDetected) {
         if (!decidedAsText || checkForToolCallMarker(textBuffer) !== -1) {

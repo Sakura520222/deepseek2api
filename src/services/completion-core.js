@@ -98,6 +98,18 @@ export async function consumeTaggedStream(stream, onTagged, debugCtx = null) {
   const deltaDecoder = createDeepseekDeltaDecoder();
   const parser = createSseParser(({ event, data }) => {
     debugCtx?.logSseFrame({ event, data: data.length > 2000 ? data.slice(0, 2000) + `... (${data.length} chars)` : data });
+
+    if (event === "hint") {
+      try {
+        const hint = JSON.parse(data);
+        if (hint.type === "error") {
+          onTagged({ kind: "error", text: hint.content || "Upstream error", code: hint.finish_reason || "upstream_error" });
+          return;
+        }
+      } catch { /* not a valid JSON hint */ }
+      return;
+    }
+
     const delta = deltaDecoder.consume(data);
     if (delta?.text) {
       debugCtx?.logDelta(delta.kind, delta.text);
@@ -116,6 +128,11 @@ export async function collectTaggedContent(stream, debugCtx = null) {
   let reasoningContent = "";
 
   await consumeTaggedStream(stream, (tagged) => {
+    if (tagged.kind === "error") {
+      const err = new Error(tagged.text);
+      err.code = tagged.code;
+      throw err;
+    }
     if (tagged.kind === "thinking") {
       reasoningContent += tagged.text;
     } else {

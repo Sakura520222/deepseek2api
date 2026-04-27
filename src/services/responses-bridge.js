@@ -305,7 +305,8 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         toolCallDetected: false,
         toolCallBuffer: "",
         toolCalls: null,
-        decidedAsText: false
+        decidedAsText: false,
+        upstreamError: null
       };
 
       const textOutputBaseIdx = () => state.reasoningItemId ? 1 : 0;
@@ -315,6 +316,12 @@ export async function streamResponsesResult({ response, account, body, deleteAft
       }
 
       await consumeTaggedStream(dsResponse.body, (tagged) => {
+        if (tagged.kind === "error") {
+          state.upstreamError = tagged;
+          return;
+        }
+        if (state.upstreamError) return;
+
         if (tagged.kind === "thinking") {
           if (!state.reasoningItemId) {
             state.reasoningItemId = `rs_${randomUUID()}`;
@@ -375,6 +382,21 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           emitTextChunk(toStream);
         }
       }, debugCtx);
+
+      if (state.upstreamError) {
+        debugCtx?.logFinalResponse({ error: state.upstreamError.text, code: state.upstreamError.code });
+        writeSSE("response.failed", {
+          response: {
+            id: responseId, object: "response", created_at: created,
+            status: "failed",
+            error: { type: "upstream_error", code: state.upstreamError.code, message: state.upstreamError.text },
+            model: modelId, output: [],
+            usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+          }
+        });
+        response.end();
+        return;
+      }
 
       if (state.textAccumulator && !state.toolCallDetected) {
         if (state.decidedAsText) {

@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 
 const TOOL_CALL_PREFIX = "<tool_call";
+const TOOL_CALLS_PREFIX = "<tool_calls";
 const FUNCTION_CALL_PREFIX = "<function_call";
 const AGENT_CALL_PREFIX = "[调用 Agent]";
+const PARAMETER_PREFIX = "<parameter";
 const CODE_BLOCK_RE = /```(?:tool_call|json)\s*\n?([\s\S]*?)```/g;
 const JSON_OBJECT_RE = /\{[\s\n]*"name"\s*:\s*"[^"]+?"[\s\S]*?"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g;
 
@@ -274,11 +276,254 @@ function parseAgentCallFormat(text, markerIndex) {
   } catch { return null; }
 }
 
+// Strategy: <tool_call="name">...<tool_call attr="..." />...</tool_call="name">
+// Handles Codex's nested wrapper format with equals-value opening tag
+function parseToolCallWrapper(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  // Must be <tool_call="name">
+  const nameMatch = rest.match(/^="([^"]+)">\s*/);
+  if (!nameMatch) return null;
+
+  const toolName = nameMatch[1];
+  const contentStart = afterPrefix + nameMatch[0].length;
+
+  // Collect content up to the outer closing tag
+  const toolCalls = [];
+  let searchPos = contentStart;
+
+  // Find the outer closing boundary — skip inner closing tags
+  // Count nested <tool_calls> openings and match with closings
+  let outerEnd = text.length;
+  let depth = 0;
+  for (let i = contentStart; i < text.length; i++) {
+    if (text.startsWith("<tool_calls", i) && !text.startsWith("</tool_calls", i)) {
+      // Check it's an opening tag (not self-closing)
+      const afterGt = text.indexOf(">", i + TOOL_CALLS_PREFIX.length);
+      if (afterGt !== -1 && text[afterGt - 1] !== "/") {
+        depth++;
+      }
+    } else if (text.startsWith("</tool_calls", i)) {
+      if (depth > 0) {
+        depth--;
+      } else {
+        // This is the closing tag for our wrapper — but we look for </tool_call
+        // Actually </tool_calls> might close an inner wrapper; skip if depth > 0
+      }
+    } else if (text.startsWith("</tool_call", i) && !text.startsWith("</tool_calls", i)) {
+      // </tool_call...> could be our closing tag
+      const gt = text.indexOf(">", i);
+      outerEnd = gt !== -1 ? gt + 1 : i;
+      break;
+    }
+  }
+
+  const content = text.slice(contentStart, outerEnd);
+
+  // Extract all self-closing <tool_call ... /> from the content
+  // These inherit the wrapper's tool name
+  const selfCloseRe = /<tool_call\s+([\s\S]*?)\/>/g;
+  let m;
+  while ((m = selfCloseRe.exec(content)) !== null) {
+    const attrText = m[1];
+    const attrs = {};
+    const attrRe = /(\w+)\s*=\s*"([^"]*)"/g;
+    let am;
+    while ((am = attrRe.exec(attrText)) !== null) {
+      attrs[am[1]] = am[2];
+    }
+    if (Object.keys(attrs).length === 0) continue;
+
+    // Use wrapper name as tool name; self-closing tags are parameters of the wrapper tool
+    const name = attrs.name || toolName;
+    const args = {};
+    for (const [k, v] of Object.entries(attrs)) {
+      if (k !== "name") args[k] = v;
+    }
+    toolCalls.push(makeToolCall(name, args));
+  }
+
+  if (toolCalls.length === 0) {
+    toolCalls.push(makeToolCall(toolName, {}));
+  }
+
+  return { toolCalls, endIndex: outerEnd };
+}
+
+// Strategy: <tool_call command="..." justification="..." />
+// Handles Codex's self-closing attribute format
+function parseSelfClosingAttr(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  // Must have whitespace then attributes (not = or >)
+  const wsMatch = rest.match(/^\s+/);
+  if (!wsMatch) return null;
+
+  const attrText = rest.slice(wsMatch[0].length);
+
+  // Check for self-closing />
+  // Extract all attributes: name="value" or just bare attributes
+  const attrs = {};
+  const attrRe = /(\w+)\s*=\s*"([^"]*)"/g;
+  let m;
+  while ((m = attrRe.exec(attrText)) !== null) {
+    attrs[m[1]] = m[2];
+  }
+
+  if (Object.keys(attrs).length === 0) return null;
+
+  // Find the self-closing />
+  const closeIdx = attrText.indexOf("/>");
+  if (closeIdx === -1) return null;
+
+  // Determine tool name - prefer "name" attr, fall back to first attr or "shell"
+  const name = attrs.name || Object.keys(attrs)[0] || "shell";
+
+  // Build arguments from remaining attributes (exclude 'name')
+  const args = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k !== "name") args[k] = v;
+  }
+
+  const endIndex = markerIndex + TOOL_CALL_PREFIX.length + wsMatch[0].length + closeIdx + 2;
+  return { toolCalls: [makeToolCall(name, args)], endIndex };
+}
+
+// Strategy: <tool_calls>...inner content...</tool_calls>
+// Strips the outer <tool_calls> wrapper and delegates to inner strategies
+function parseToolCallsWrapper(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CALLS_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  // Must be <tool_calls> (with optional whitespace before >)
+  const gtMatch = rest.match(/^\s*>/);
+  if (!gtMatch) return null;
+
+  const contentStart = afterPrefix + gtMatch[0].length;
+
+  // Find matching </tool_calls> with depth tracking
+  let depth = 1;
+  let pos = contentStart;
+  let closeEnd = -1;
+
+  while (pos < text.length && depth > 0) {
+    const nextOpen = text.indexOf("<tool_calls", pos);
+    const nextClose = text.indexOf("</tool_calls", pos);
+
+    if (nextClose === -1) break;
+
+    if (nextOpen !== -1 && nextOpen < nextClose) {
+      // Check it's a real opening tag (has > after attributes, not />)
+      const afterOpen = text.slice(nextOpen + TOOL_CALLS_PREFIX.length);
+      const openGt = afterOpen.indexOf(">");
+      if (openGt !== -1 && afterOpen[openGt - 1] !== "/") {
+        depth++;
+      }
+      pos = nextOpen + TOOL_CALLS_PREFIX.length + 1;
+      continue;
+    }
+
+    depth--;
+    if (depth === 0) {
+      const content = text.slice(contentStart, nextClose);
+      const gt = text.indexOf(">", nextClose);
+      closeEnd = gt !== -1 ? gt + 1 : nextClose + "</tool_calls>".length;
+
+      const innerCalls = extractToolCalls(content);
+      if (innerCalls && innerCalls.length > 0) {
+        return { toolCalls: innerCalls, endIndex: closeEnd };
+      }
+    }
+    pos = nextClose + 1;
+  }
+
+  // No closing tag found — extract from remaining content
+  const content = text.slice(contentStart);
+  const innerCalls = extractToolCalls(content);
+  if (innerCalls && innerCalls.length > 0) {
+    return { toolCalls: innerCalls, endIndex: text.length };
+  }
+
+  return null;
+}
+
+// Strategy: <parameter name="query" tool="web_search">value</parameter>
+// OpenClaw format: multiple <parameter> tags with tool/tool_name attr aggregate into one call
+function parseParameterTags(text, markerIndex) {
+  const closeTag = "</parameter>";
+
+  // Parse a single <parameter> tag starting at pos, return {attrs, value, endIndex} or null
+  function parseOneParam(pos) {
+    if (!text.startsWith("<parameter", pos)) return null;
+    const after = pos + PARAMETER_PREFIX.length;
+    const rest = text.slice(after);
+
+    const wsMatch = rest.match(/^\s+/);
+    if (!wsMatch) return null;
+
+    const openGt = rest.indexOf(">");
+    if (openGt === -1) return null;
+
+    const attrText = rest.slice(wsMatch[0].length, openGt);
+    const attrs = {};
+    const attrRe = /(\w+)\s*=\s*"([^"]*)"/g;
+    let m;
+    while ((m = attrRe.exec(attrText)) !== null) {
+      attrs[m[1]] = m[2];
+    }
+
+    const valueStart = after + openGt + 1;
+    const closeIdx = text.indexOf(closeTag, valueStart);
+    if (closeIdx === -1) return null;
+
+    const value = text.slice(valueStart, closeIdx).trim();
+    return { attrs, value, endIndex: closeIdx + closeTag.length };
+  }
+
+  // Parse the first parameter
+  const first = parseOneParam(markerIndex);
+  if (!first) return null;
+
+  const toolName = first.attrs.tool || first.attrs.tool_name;
+  if (!toolName) return null;
+
+  const args = { [first.attrs.name || "input"]: first.value };
+  let scanPos = first.endIndex;
+
+  // Aggregate consecutive <parameter> tags for the same tool
+  // Only aggregate if they are separated by single newlines (no blank lines between)
+  while (scanPos < text.length) {
+    // Collect whitespace between current pos and next <parameter>
+    let gapStart = scanPos;
+    while (scanPos < text.length && /\s/.test(text[scanPos])) scanPos++;
+
+    // If there's a blank line (double newline) in the gap, stop aggregating
+    const gap = text.slice(gapStart, scanPos);
+    if (gap.includes("\n\n") || gap.includes("\r\n\r\n")) break;
+
+    const next = parseOneParam(scanPos);
+    if (!next) break;
+
+    const nextTool = next.attrs.tool || next.attrs.tool_name;
+    if (nextTool !== toolName) break;
+
+    const nextName = next.attrs.name || "input";
+    args[nextName] = next.value;
+    scanPos = next.endIndex;
+  }
+
+  return { toolCalls: [makeToolCall(toolName, args)], endIndex: scanPos };
+}
+
 // --- Marker-based strategies dispatcher ---
 
 const MARKER_STRATEGIES = [
-  { prefix: TOOL_CALL_PREFIX, parsers: [parseInlineFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
+  { prefix: TOOL_CALL_PREFIX, parsers: [parseToolCallWrapper, parseSelfClosingAttr, parseInlineFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
+  { prefix: TOOL_CALLS_PREFIX, parsers: [parseToolCallsWrapper] },
   { prefix: FUNCTION_CALL_PREFIX, parsers: [parseFunctionCallXml, parseXmlParamFormat] },
+  { prefix: PARAMETER_PREFIX, parsers: [parseParameterTags] },
   { prefix: AGENT_CALL_PREFIX, parsers: [parseAgentCallFormat] },
 ];
 
@@ -325,7 +570,7 @@ export function extractToolCalls(text) {
   }
 
   // Last resort: try to find standalone JSON objects with "name" + "arguments"
-  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
+  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
     JSON_OBJECT_RE.lastIndex = 0;
     let match;
     while ((match = JSON_OBJECT_RE.exec(text)) !== null) {

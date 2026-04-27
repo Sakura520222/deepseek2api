@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import { buildPromptFromMessages } from "../utils/prompt.js";
 import { buildToolSystemPrompt, extractToolCalls } from "../utils/tool-prompt.js";
 import {
+  checkForToolCallMarker,
   collectTaggedContent,
   consumeTaggedStream,
   filterToolCalls,
-  findToolCallMarker,
   isPartialMarker,
   startCompletion,
   TOOL_CALL_MARKERS,
+  MARKER_START_CHARS,
   withCompletionSession
 } from "./completion-core.js";
 import { resolveOpenAiModel, resolveToolCallModel } from "./openai-request.js";
@@ -154,20 +155,22 @@ function formatAnthropicContent(toolCalls, content, reasoningContent) {
   return contentBlocks;
 }
 
-export async function collectAnthropicMessage({ account, body, deleteAfterFinish }) {
+export async function collectAnthropicMessage({ account, body, deleteAfterFinish, debugCtx }) {
   const requestOptions = resolveAnthropicRequest(body);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response } = await startCompletion({ account, requestOptions, sessionId });
-      const { content, reasoningContent } = await collectTaggedContent(response.body);
+      const { response } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
+      const { content, reasoningContent } = await collectTaggedContent(response.body, debugCtx);
 
+      const rawToolCalls = extractToolCalls(content, debugCtx);
       const toolCalls = requestOptions.tools
-        ? filterToolCalls(extractToolCalls(content), requestOptions.tools)
-        : null;
+        ? filterToolCalls(rawToolCalls, requestOptions.tools)
+        : rawToolCalls;
 
       const contentBlocks = formatAnthropicContent(toolCalls, content, reasoningContent);
 
@@ -189,17 +192,18 @@ function writeSSE(response, eventType, data) {
   response.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-export async function streamAnthropicMessage({ response, account, body, deleteAfterFinish }) {
+export async function streamAnthropicMessage({ response, account, body, deleteAfterFinish, debugCtx }) {
   const messageId = `msg_${randomUUID()}`;
   const requestOptions = resolveAnthropicRequest(body);
   const modelName = requestOptions.modelName;
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId });
+      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
 
       response.writeHead(200, {
         "cache-control": "no-cache, no-transform",
@@ -226,7 +230,9 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       let textAccumulator = "";
       let toolCallDetected = false;
       let toolCallBuffer = "";
+      let decidedAsText = false;
       let hasToolCalls = false;
+      let upstreamError = null;
 
       function startThinkingBlock() {
         if (reasoningBlockOpen) return;
@@ -266,71 +272,111 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
         blockIndex++;
       }
 
-      if (requestOptions.tools) {
-        await consumeTaggedStream(dsResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            startThinkingBlock();
-            writeSSE(response, "content_block_delta", {
-              type: "content_block_delta",
-              index: blockIndex,
-              delta: { type: "thinking_delta", thinking: tagged.text }
-            });
-            return;
-          }
+      await consumeTaggedStream(dsResponse.body, (tagged) => {
+        if (tagged.kind === "error") {
+          upstreamError = tagged;
+          return;
+        }
+        if (upstreamError) return;
 
-          const text = tagged.text;
-          if (reasoningBlockOpen) {
-            closeThinkingBlock();
-          }
-          if (toolCallDetected) {
-            toolCallBuffer += text;
-            return;
-          }
+        if (tagged.kind === "thinking") {
+          startThinkingBlock();
+          writeSSE(response, "content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "thinking_delta", thinking: tagged.text }
+          });
+          return;
+        }
 
-          textAccumulator += text;
-          const markerIndex = findToolCallMarker(textAccumulator);
-          if (markerIndex !== -1) {
-            toolCallDetected = true;
-            toolCallBuffer = textAccumulator.slice(markerIndex);
-            const before = textAccumulator.slice(0, markerIndex);
-            textAccumulator = "";
-            if (before) {
-              startTextBlock();
-              writeSSE(response, "content_block_delta", {
-                type: "content_block_delta",
-                index: blockIndex,
-                delta: { type: "text_delta", text: before }
-              });
-            }
-            return;
-          }
+        const text = tagged.text;
+        if (reasoningBlockOpen) {
+          closeThinkingBlock();
+        }
+        if (toolCallDetected) {
+          toolCallBuffer += text;
+          return;
+        }
 
-          let safeEnd = textAccumulator.length;
-          if (isPartialMarker(textAccumulator)) {
-            for (let i = Math.max(0, textAccumulator.length - 20); i < textAccumulator.length; i++) {
-              if (textAccumulator[i] !== "<" && textAccumulator[i] !== "`") continue;
-              const tail = textAccumulator.slice(i);
-              let isPartial = false;
-              for (const marker of TOOL_CALL_MARKERS) {
-                if (marker.startsWith(tail)) { isPartial = true; break; }
-              }
-              if (tail.startsWith("```")) { isPartial = true; }
-              if (isPartial) { safeEnd = i; break; }
-            }
-          }
-          const toStream = textAccumulator.slice(0, safeEnd);
-          textAccumulator = textAccumulator.slice(safeEnd);
-
-          if (toStream) {
+        textAccumulator += text;
+        const markerIndex = checkForToolCallMarker(textAccumulator);
+        if (markerIndex !== -1) {
+          debugCtx?.logToolDetection({
+            markerFound: true,
+            markerIndex,
+            textBeforeMarker: textAccumulator.slice(0, markerIndex).slice(-100),
+            markerPrefix: textAccumulator.slice(markerIndex, markerIndex + 30)
+          });
+          toolCallDetected = true;
+          toolCallBuffer = textAccumulator.slice(markerIndex);
+          const before = textAccumulator.slice(0, markerIndex);
+          textAccumulator = "";
+          if (before) {
             startTextBlock();
             writeSSE(response, "content_block_delta", {
               type: "content_block_delta",
               index: blockIndex,
-              delta: { type: "text_delta", text: toStream }
+              delta: { type: "text_delta", text: before }
             });
           }
-        });
+          return;
+        }
 
+        let safeEnd = textAccumulator.length;
+        if (isPartialMarker(textAccumulator)) {
+          for (let i = Math.max(0, textAccumulator.length - 20); i < textAccumulator.length; i++) {
+            if (!MARKER_START_CHARS.includes(textAccumulator[i])) continue;
+            const tail = textAccumulator.slice(i);
+            let isPartial = false;
+            for (const marker of TOOL_CALL_MARKERS) {
+              if (marker.startsWith(tail)) { isPartial = true; break; }
+            }
+            if (tail.startsWith("```")) { isPartial = true; }
+            if (tail.startsWith('{"na')) { isPartial = true; }
+            if (isPartial) { safeEnd = i; break; }
+          }
+        }
+        const toStream = textAccumulator.slice(0, safeEnd);
+        textAccumulator = textAccumulator.slice(safeEnd);
+
+        if (toStream) {
+          decidedAsText = true;
+          startTextBlock();
+          writeSSE(response, "content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "text_delta", text: toStream }
+          });
+        }
+      }, debugCtx);
+
+      if (upstreamError) {
+        debugCtx?.logFinalResponse({ error: upstreamError.text, code: upstreamError.code });
+        writeSSE(response, "error", {
+          type: "error",
+          error: { type: "api_error", message: upstreamError.text }
+        });
+        response.end();
+        return;
+      }
+
+      if (textAccumulator && !toolCallDetected) {
+        if (decidedAsText) {
+          const markerIdx = checkForToolCallMarker(textAccumulator);
+          if (markerIdx !== -1) {
+            const before = textAccumulator.slice(0, markerIdx);
+            if (before) {
+              startTextBlock();
+              writeSSE(response, "content_block_delta", {
+                type: "content_block_delta", index: blockIndex,
+                delta: { type: "text_delta", text: before }
+              });
+            }
+            toolCallDetected = true;
+            toolCallBuffer = textAccumulator.slice(markerIdx);
+            textAccumulator = "";
+          }
+        }
         if (textAccumulator && !toolCallDetected) {
           startTextBlock();
           writeSSE(response, "content_block_delta", {
@@ -340,71 +386,53 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
           });
           textAccumulator = "";
         }
+      }
 
-        closeThinkingBlock();
-        closeTextBlock();
+      closeThinkingBlock();
+      closeTextBlock();
 
-        if (toolCallDetected) {
-          const toolCalls = filterToolCalls(extractToolCalls(toolCallBuffer), requestOptions.tools);
-          if (toolCalls) {
-            hasToolCalls = true;
-            for (const tc of toolCalls) {
-              let input;
-              try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+      if (toolCallDetected) {
+        const rawToolCalls = extractToolCalls(toolCallBuffer, debugCtx);
+        const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
+        debugCtx?.logToolDetection({
+          toolCallBufferLength: toolCallBuffer.length,
+          rawToolCallCount: rawToolCalls?.length ?? 0,
+          filteredToolCallCount: toolCalls?.length ?? 0,
+          toolCalls: toolCalls?.map(tc => ({ name: tc.function.name, id: tc.id })) ?? []
+        });
+        if (toolCalls) {
+          hasToolCalls = true;
+          for (const tc of toolCalls) {
+            let input;
+            try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
 
-              writeSSE(response, "content_block_start", {
-                type: "content_block_start",
-                index: blockIndex,
-                content_block: { type: "tool_use", id: tc.id, name: tc.function.name, input: {} }
-              });
-              writeSSE(response, "content_block_delta", {
-                type: "content_block_delta",
-                index: blockIndex,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments }
-              });
-              writeSSE(response, "content_block_stop", {
-                type: "content_block_stop", index: blockIndex
-              });
-              blockIndex++;
-            }
-          } else {
-            startTextBlock();
+            writeSSE(response, "content_block_start", {
+              type: "content_block_start",
+              index: blockIndex,
+              content_block: { type: "tool_use", id: tc.id, name: tc.function.name, input: {} }
+            });
             writeSSE(response, "content_block_delta", {
               type: "content_block_delta",
               index: blockIndex,
-              delta: { type: "text_delta", text: toolCallBuffer }
+              delta: { type: "input_json_delta", partial_json: tc.function.arguments }
             });
-            closeTextBlock();
-          }
-        }
-      } else {
-        await consumeTaggedStream(dsResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            startThinkingBlock();
-            writeSSE(response, "content_block_delta", {
-              type: "content_block_delta",
-              index: blockIndex,
-              delta: { type: "thinking_delta", thinking: tagged.text }
+            writeSSE(response, "content_block_stop", {
+              type: "content_block_stop", index: blockIndex
             });
-            return;
+            blockIndex++;
           }
-
-          if (reasoningBlockOpen) {
-            closeThinkingBlock();
-          }
-
+        } else {
           startTextBlock();
           writeSSE(response, "content_block_delta", {
             type: "content_block_delta",
             index: blockIndex,
-            delta: { type: "text_delta", text: tagged.text }
+            delta: { type: "text_delta", text: toolCallBuffer }
           });
-          textAccumulator += tagged.text;
-        });
-
-        closeThinkingBlock();
-        closeTextBlock();
+          closeTextBlock();
+        }
       }
+
+      debugCtx?.logFinalResponse({ stop_reason: hasToolCalls ? "tool_use" : "end_turn" });
 
       writeSSE(response, "message_delta", {
         type: "message_delta",

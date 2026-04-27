@@ -3,13 +3,14 @@ import { randomUUID } from "node:crypto";
 import { buildPromptFromMessages } from "../utils/prompt.js";
 import { buildToolSystemPrompt, extractToolCalls } from "../utils/tool-prompt.js";
 import {
+  checkForToolCallMarker,
   collectTaggedContent,
   consumeTaggedStream,
   filterToolCalls,
-  findToolCallMarker,
   isPartialMarker,
   startCompletion,
   TOOL_CALL_MARKERS,
+  MARKER_START_CHARS,
   withCompletionSession
 } from "./completion-core.js";
 import { resolveOpenAiModel, resolveToolCallModel } from "./openai-request.js";
@@ -114,15 +115,6 @@ function resolveResponsesRequest(body) {
   const resolvedModel = resolveOpenAiModel(body.model);
   const model = tools?.length ? resolveToolCallModel(resolvedModel) : resolvedModel;
 
-  if (process.env.DEBUG_TOOL_CALL) {
-    console.log("[responses-bridge] model:", body.model, "-> resolved:", resolvedModel.id,
-      "| tools:", tools?.length, "| toolChoice:", toolChoice,
-      "| input type:", Array.isArray(input) ? "array" : typeof input,
-      "| input length:", Array.isArray(input) ? input.length : (typeof input === "string" ? input.length : 0),
-      "| toolPrompt:", toolPrompt ? `${toolPrompt.length} chars` : "null");
-    console.log("[responses-bridge] prompt:\n", buildPromptFromMessages(messages, null));
-  }
-
   return {
     model,
     prompt: buildPromptFromMessages(messages, null),
@@ -177,20 +169,22 @@ function buildResponsesOutput(toolCalls, content, reasoningContent) {
   return output;
 }
 
-export async function collectResponsesResult({ account, body, deleteAfterFinish }) {
+export async function collectResponsesResult({ account, body, deleteAfterFinish, debugCtx }) {
   const requestOptions = resolveResponsesRequest(body);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response } = await startCompletion({ account, requestOptions, sessionId });
-      const { content, reasoningContent } = await collectTaggedContent(response.body);
+      const { response } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
+      const { content, reasoningContent } = await collectTaggedContent(response.body, debugCtx);
 
+      const rawToolCalls = extractToolCalls(content, debugCtx);
       const toolCalls = requestOptions.tools
-        ? filterToolCalls(extractToolCalls(content), requestOptions.tools)
-        : null;
+        ? filterToolCalls(rawToolCalls, requestOptions.tools)
+        : rawToolCalls;
 
       const output = buildResponsesOutput(toolCalls, content, reasoningContent);
       const now = Math.floor(Date.now() / 1000);
@@ -269,18 +263,19 @@ function emitMessageDone(writeSSE, state, text, outIdx) {
   });
 }
 
-export async function streamResponsesResult({ response, account, body, deleteAfterFinish }) {
+export async function streamResponsesResult({ response, account, body, deleteAfterFinish, debugCtx }) {
   const responseId = `resp_${randomUUID()}`;
   const requestOptions = resolveResponsesRequest(body);
   const modelId = requestOptions.model.id;
   const created = Math.floor(Date.now() / 1000);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId });
+      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
 
       response.writeHead(200, {
         "cache-control": "no-cache, no-transform",
@@ -309,7 +304,9 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         reasoningAccumulator: "",
         toolCallDetected: false,
         toolCallBuffer: "",
-        toolCalls: null
+        toolCalls: null,
+        decidedAsText: false,
+        upstreamError: null
       };
 
       const textOutputBaseIdx = () => state.reasoningItemId ? 1 : 0;
@@ -318,136 +315,146 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         emitResponseTextChunk(writeSSE, textOutputBaseIdx(), text, state);
       }
 
-      if (requestOptions.tools) {
-        await consumeTaggedStream(dsResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            if (!state.reasoningItemId) {
-              state.reasoningItemId = `rs_${randomUUID()}`;
-              writeSSE("response.output_item.added", {
-                output_index: 0,
-                item: { type: "reasoning", id: state.reasoningItemId, summary: [] }
-              });
-            }
-            writeSSE("response.reasoning_text.delta", {
-              item_id: state.reasoningItemId,
-              output_index: 0, delta: tagged.text
+      await consumeTaggedStream(dsResponse.body, (tagged) => {
+        if (tagged.kind === "error") {
+          state.upstreamError = tagged;
+          return;
+        }
+        if (state.upstreamError) return;
+
+        if (tagged.kind === "thinking") {
+          if (!state.reasoningItemId) {
+            state.reasoningItemId = `rs_${randomUUID()}`;
+            writeSSE("response.output_item.added", {
+              output_index: 0,
+              item: { type: "reasoning", id: state.reasoningItemId, summary: [] }
             });
-            state.reasoningAccumulator += tagged.text;
-            return;
           }
+          writeSSE("response.reasoning_text.delta", {
+            item_id: state.reasoningItemId,
+            output_index: 0, delta: tagged.text
+          });
+          state.reasoningAccumulator += tagged.text;
+          return;
+        }
 
-          const text = tagged.text;
-          if (state.toolCallDetected) {
-            state.toolCallBuffer += text;
-            return;
-          }
+        const text = tagged.text;
+        if (state.toolCallDetected) {
+          state.toolCallBuffer += text;
+          return;
+        }
 
-          state.textAccumulator += text;
-          const markerIndex = findToolCallMarker(state.textAccumulator);
-          if (markerIndex !== -1) {
-            state.toolCallDetected = true;
-            state.toolCallBuffer = state.textAccumulator.slice(markerIndex);
-            const before = state.textAccumulator.slice(0, markerIndex);
-            state.textAccumulator = "";
-            if (before) emitTextChunk(before);
-            return;
-          }
+        state.textAccumulator += text;
+        const markerIndex = checkForToolCallMarker(state.textAccumulator);
+        if (markerIndex !== -1) {
+          debugCtx?.logToolDetection({
+            markerFound: true,
+            markerIndex,
+            textBeforeMarker: state.textAccumulator.slice(0, markerIndex).slice(-100),
+            markerPrefix: state.textAccumulator.slice(markerIndex, markerIndex + 30)
+          });
+          state.toolCallDetected = true;
+          state.toolCallBuffer = state.textAccumulator.slice(markerIndex);
+          const before = state.textAccumulator.slice(0, markerIndex);
+          state.textAccumulator = "";
+          if (before) emitTextChunk(before);
+          return;
+        }
 
-          let safeEnd = state.textAccumulator.length;
-          if (isPartialMarker(state.textAccumulator)) {
-            for (let i = Math.max(0, state.textAccumulator.length - 20); i < state.textAccumulator.length; i++) {
-              if (state.textAccumulator[i] !== "<" && state.textAccumulator[i] !== "`") continue;
-              const tail = state.textAccumulator.slice(i);
-              let isPartial = false;
-              for (const marker of TOOL_CALL_MARKERS) {
-                if (marker.startsWith(tail)) { isPartial = true; break; }
-              }
-              if (tail.startsWith("```")) { isPartial = true; }
-              if (isPartial) { safeEnd = i; break; }
+        let safeEnd = state.textAccumulator.length;
+        if (isPartialMarker(state.textAccumulator)) {
+          for (let i = Math.max(0, state.textAccumulator.length - 20); i < state.textAccumulator.length; i++) {
+            if (!MARKER_START_CHARS.includes(state.textAccumulator[i])) continue;
+            const tail = state.textAccumulator.slice(i);
+            let isPartial = false;
+            for (const marker of TOOL_CALL_MARKERS) {
+              if (marker.startsWith(tail)) { isPartial = true; break; }
             }
+            if (tail.startsWith("```")) { isPartial = true; }
+            if (tail.startsWith('{"na')) { isPartial = true; }
+            if (isPartial) { safeEnd = i; break; }
           }
-          const toStream = state.textAccumulator.slice(0, safeEnd);
-          state.textAccumulator = state.textAccumulator.slice(safeEnd);
-          if (toStream) emitTextChunk(toStream);
-        });
+        }
+        const toStream = state.textAccumulator.slice(0, safeEnd);
+        state.textAccumulator = state.textAccumulator.slice(safeEnd);
+        if (toStream) {
+          state.decidedAsText = true;
+          emitTextChunk(toStream);
+        }
+      }, debugCtx);
 
+      if (state.upstreamError) {
+        debugCtx?.logFinalResponse({ error: state.upstreamError.text, code: state.upstreamError.code });
+        writeSSE("response.failed", {
+          response: {
+            id: responseId, object: "response", created_at: created,
+            status: "failed",
+            error: { type: "upstream_error", code: state.upstreamError.code, message: state.upstreamError.text },
+            model: modelId, output: [],
+            usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0 }
+          }
+        });
+        response.end();
+        return;
+      }
+
+      if (state.textAccumulator && !state.toolCallDetected) {
+        if (state.decidedAsText) {
+          const markerIdx = checkForToolCallMarker(state.textAccumulator);
+          if (markerIdx !== -1) {
+            const before = state.textAccumulator.slice(0, markerIdx);
+            if (before) emitTextChunk(before);
+            state.toolCallDetected = true;
+            state.toolCallBuffer = state.textAccumulator.slice(markerIdx);
+            state.textAccumulator = "";
+          }
+        }
         if (state.textAccumulator && !state.toolCallDetected) {
           emitTextChunk(state.textAccumulator);
           state.textAccumulator = "";
         }
-
-        emitReasoningDone(writeSSE, state);
-        emitMessageDone(writeSSE, state, state.emittedText, textOutputBaseIdx());
-
-        if (state.toolCallDetected) {
-          const toolCalls = filterToolCalls(extractToolCalls(state.toolCallBuffer), requestOptions.tools);
-          state.toolCalls = toolCalls;
-          if (toolCalls) {
-            let fcIdx = textOutputBaseIdx() + (state.messageItemId ? 1 : 0);
-            for (const tc of toolCalls) {
-              const fcId = `fc_${randomUUID()}`;
-              writeSSE("response.output_item.added", {
-                output_index: fcIdx,
-                item: { type: "function_call", id: fcId, call_id: tc.id, name: tc.function.name }
-              });
-              writeSSE("response.function_call_arguments.delta", {
-                output_index: fcIdx, item_id: fcId, delta: tc.function.arguments
-              });
-              writeSSE("response.function_call_arguments.done", {
-                output_index: fcIdx, item_id: fcId, arguments: tc.function.arguments
-              });
-              writeSSE("response.output_item.done", {
-                output_index: fcIdx,
-                item: { type: "function_call", id: fcId, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments }
-              });
-              fcIdx++;
-            }
-          } else {
-            emitTextChunk(state.toolCallBuffer);
-            emitMessageDone(writeSSE, state, state.toolCallBuffer, textOutputBaseIdx());
-          }
-        }
-      } else {
-        await consumeTaggedStream(dsResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            if (!state.reasoningItemId) {
-              state.reasoningItemId = `rs_${randomUUID()}`;
-              writeSSE("response.output_item.added", {
-                output_index: 0,
-                item: { type: "reasoning", id: state.reasoningItemId, summary: [] }
-              });
-            }
-            writeSSE("response.reasoning_text.delta", {
-              item_id: state.reasoningItemId,
-              output_index: 0, delta: tagged.text
-            });
-            state.reasoningAccumulator += tagged.text;
-            return;
-          }
-
-          const outIdx = textOutputBaseIdx();
-          if (!state.messageItemId) {
-            state.messageItemId = `msg_${randomUUID()}`;
-            writeSSE("response.output_item.added", {
-              output_index: outIdx,
-              item: { id: state.messageItemId, type: "message", role: "assistant", content: [] }
-            });
-            writeSSE("response.content_part.added", {
-              item_id: state.messageItemId,
-              output_index: outIdx, content_index: 0,
-              part: { type: "output_text", text: "" }
-            });
-          }
-          writeSSE("response.output_text.delta", {
-            item_id: state.messageItemId,
-            output_index: outIdx, content_index: 0, delta: tagged.text
-          });
-          state.emittedText += tagged.text;
-        });
-
-        emitReasoningDone(writeSSE, state);
-        emitMessageDone(writeSSE, state, state.emittedText, textOutputBaseIdx());
       }
+
+      emitReasoningDone(writeSSE, state);
+      emitMessageDone(writeSSE, state, state.emittedText, textOutputBaseIdx());
+
+      if (state.toolCallDetected) {
+        const rawToolCalls = extractToolCalls(state.toolCallBuffer, debugCtx);
+        const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
+        state.toolCalls = toolCalls;
+        debugCtx?.logToolDetection({
+          toolCallBufferLength: state.toolCallBuffer.length,
+          rawToolCallCount: rawToolCalls?.length ?? 0,
+          filteredToolCallCount: toolCalls?.length ?? 0,
+          toolCalls: toolCalls?.map(tc => ({ name: tc.function.name, id: tc.id })) ?? []
+        });
+        if (toolCalls) {
+          let fcIdx = textOutputBaseIdx() + (state.messageItemId ? 1 : 0);
+          for (const tc of toolCalls) {
+            const fcId = `fc_${randomUUID()}`;
+            writeSSE("response.output_item.added", {
+              output_index: fcIdx,
+              item: { type: "function_call", id: fcId, call_id: tc.id, name: tc.function.name }
+            });
+            writeSSE("response.function_call_arguments.delta", {
+              output_index: fcIdx, item_id: fcId, delta: tc.function.arguments
+            });
+            writeSSE("response.function_call_arguments.done", {
+              output_index: fcIdx, item_id: fcId, arguments: tc.function.arguments
+            });
+            writeSSE("response.output_item.done", {
+              output_index: fcIdx,
+              item: { type: "function_call", id: fcId, call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments }
+            });
+            fcIdx++;
+          }
+        } else {
+          emitTextChunk(state.toolCallBuffer);
+          emitMessageDone(writeSSE, state, state.toolCallBuffer, textOutputBaseIdx());
+        }
+      }
+
+      debugCtx?.logFinalResponse({ toolCalls: state.toolCalls?.map(tc => ({ name: tc.function.name })) ?? null });
 
       const output = [];
       if (state.reasoningAccumulator) {

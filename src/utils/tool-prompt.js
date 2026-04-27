@@ -84,6 +84,51 @@ function parseInlineFormat(text, markerIndex) {
   }
 }
 
+// Loose extract for broken JSON with unescaped quotes in command values
+// e.g. {"command": "pwsh -Command "echo hi"", "timeout": 15}
+function extractLooseCommandArgs(text, jsonStart) {
+  if (text[jsonStart] !== "{") return null;
+
+  // Find "command": ... pattern
+  const cmdMatch = text.slice(jsonStart).match(/^(\{[\s\n]*)("command")\s*:\s*/);
+  if (!cmdMatch) return null;
+
+  const prefixLen = cmdMatch[0].length;
+  const cmdValStart = jsonStart + prefixLen;
+  if (text[cmdValStart] !== '"') return null;
+
+  // The command string has unescaped inner quotes. Use heuristic:
+  // Find the next ", "timeout" or "}}" pattern after cmdValStart
+  const delimRe = /",\s*"timeout"\s*:\s*\d+|"\s*\}\}/g;
+  delimRe.lastIndex = cmdValStart + 1;
+  const delimMatch = delimRe.exec(text);
+  if (!delimMatch) return null;
+
+  // The command value ends at the quote just before the delimiter
+  // delimMatch.index points to the closing quote + comma/brace
+  // Walk back from delimMatch.index to find the actual closing "
+  let closeQuote = delimMatch.index;
+  // delimMatch includes the leading ", so closeQuote points to "
+  // The command value is between cmdValStart+1 and closeQuote
+  const cmdVal = text.slice(cmdValStart + 1, closeQuote);
+
+  // Extract timeout
+  const timeoutMatch = text.slice(closeQuote).match(/"timeout"\s*:\s*(\d+)/);
+  const timeout = timeoutMatch ? parseInt(timeoutMatch[1]) : undefined;
+
+  // Find end of outer JSON object
+  let braceEnd = text.indexOf("}}", jsonStart);
+  if (braceEnd === -1) braceEnd = text.indexOf("}", closeQuote);
+  const endIndex = braceEnd !== -1 ? braceEnd + 2 : text.length;
+
+  const args = { command: cmdVal };
+  if (timeout !== undefined) args.timeout = timeout;
+
+  const toolName = cmdVal.trimStart().split(/\s+/)[0].replace(/\.exe$/i, "");
+  const resolved = toolName.match(/^[\$\-@]/) ? "shell" : toolName;
+  return { toolCalls: [makeToolCall(resolved, args)], endIndex };
+}
+
 // Strategy 2: <tool_call name="...">{...} or <tool_call name="arguments": {...}>
 function parseAttrFormat(text, markerIndex) {
   const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
@@ -104,15 +149,18 @@ function parseAttrFormat(text, markerIndex) {
     if (jsonResult) {
       try {
         const parsed = JSON.parse(jsonResult.json);
-        // Use "command" value prefix as tool name hint, or fall back to "shell"
         const toolName = parsed.command
           ? parsed.command.trimStart().split(/\s+/)[0].replace(/\.exe$/i, "")
           : "shell";
-        // If the first word looks like a variable/flag, fall back to "shell"
         const resolved = toolName.match(/^[\$\-@]/) ? "shell" : toolName;
         return { toolCalls: [makeToolCall(resolved, parsed)], endIndex: jsonResult.endIndex };
-      } catch { /* fall through */ }
+      } catch { /* fall through to loose extract */ }
     }
+
+    // Loose extract: strict JSON failed (e.g. unescaped quotes in command value)
+    // Extract command value and timeout by pattern matching
+    const looseResult = extractLooseCommandArgs(text, jsonStart);
+    if (looseResult) return looseResult;
   }
 
   // Standard variant: <tool_call name="...">{...}

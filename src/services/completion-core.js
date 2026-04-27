@@ -4,7 +4,7 @@ import { createDeepseekDeltaDecoder, createSseParser } from "../utils/deepseek-s
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 
-export const TOOL_CALL_MARKERS = ["<tool_call", "<function_call", "<tool_code", "<parameter", "[调用 Agent]"];
+export const TOOL_CALL_MARKERS = ["<tool_call", "<function_call", "<tool_code", "<invoke", "<parameter", "[调用 Agent]", "[Called tool:"];
 
 export const MARKER_START_CHARS = [...new Set(["<", "`", ...TOOL_CALL_MARKERS.map(m => m[0])])];
 

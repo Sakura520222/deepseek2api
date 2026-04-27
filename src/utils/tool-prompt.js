@@ -3,8 +3,10 @@ import { randomUUID } from "node:crypto";
 const TOOL_CALL_PREFIX = "<tool_call";
 const TOOL_CALLS_PREFIX = "<tool_calls";
 const TOOL_CODE_PREFIX = "<tool_code";
+const INVOKE_PREFIX = "<invoke";
 const FUNCTION_CALL_PREFIX = "<function_call";
 const AGENT_CALL_PREFIX = "[调用 Agent]";
+const CALLED_TOOL_PREFIX = "[Called tool:";
 const PARAMETER_PREFIX = "<parameter";
 const CODE_BLOCK_RE = /```(?:tool_call|json)\s*\n?([\s\S]*?)```/g;
 const JSON_OBJECT_RE = /\{[\s\n]*"name"\s*:\s*"[^"]+?"[\s\S]*?"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g;
@@ -521,6 +523,104 @@ function parseToolCallsWrapper(text, markerIndex) {
   return null;
 }
 
+// Strategy: <invoke><parameter name="url">...</parameter>...</invoke>
+function parseInvokeWrapper(text, markerIndex) {
+  const afterPrefix = markerIndex + INVOKE_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  // Must be <invoke> or <invoke name="...">
+  const gtMatch = rest.match(/^\s*>/);
+  const attrMatch = rest.match(/^\s+[^>]*>/);
+
+  let contentStart, attrText;
+  if (gtMatch) {
+    contentStart = afterPrefix + gtMatch[0].length;
+    attrText = "";
+  } else if (attrMatch) {
+    contentStart = afterPrefix + attrMatch[0].length;
+    attrText = attrMatch[0];
+  } else {
+    return null;
+  }
+
+  // Extract tool name from invoke attribute if present
+  const invokeAttrTool = attrText.match(/name\s*=\s*"([^"]+)"/);
+  const closeTag = "</invoke>";
+  const closeIdx = text.indexOf(closeTag, contentStart);
+  if (closeIdx === -1) return null;
+
+  const content = text.slice(contentStart, closeIdx);
+
+  // Try inner JSON first: <invoke>{"name": "...", "arguments": {...}}</invoke>
+  const trimmed = content.trim();
+  if (trimmed.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed.name) {
+        return { toolCalls: [makeToolCall(parsed.name, parsed.arguments)], endIndex: closeIdx + closeTag.length };
+      }
+    } catch { /* not valid JSON, try parameter extraction */ }
+  }
+
+  // Try inner tool call extraction (for nested <tool_call...> etc.)
+  const innerCalls = extractToolCalls(content);
+  if (innerCalls && innerCalls.length > 0) {
+    return { toolCalls: innerCalls, endIndex: closeIdx + closeTag.length };
+  }
+
+  // Extract <parameter name="...">value</parameter>
+  const paramRe = /<parameter\s+name\s*=\s*"([^"]+)">([\s\S]*?)<\/parameter>/g;
+  const args = {};
+  let m;
+  while ((m = paramRe.exec(content)) !== null) {
+    args[m[1]] = m[2].trim();
+  }
+
+  if (Object.keys(args).length === 0) return null;
+
+  // Determine tool name: from invoke attribute, or infer from parameters
+  const toolName = invokeAttrTool
+    ? invokeAttrTool[1]
+    : inferToolName(args);
+
+  return { toolCalls: [makeToolCall(toolName, args)], endIndex: closeIdx + closeTag.length };
+}
+
+// Infer tool name from parameter names
+function inferToolName(args) {
+  if (args.url || args.uri || args.href) return "web_fetch";
+  if (args.command || args.cmd) return "shell";
+  if (args.query && (args.count || args.maxResults)) return "web_search";
+  if (args.path && args.content) return "write";
+  if (args.path && !args.content) return "read";
+  return "tool";
+}
+
+// Strategy: [Called tool: name] {...}
+function parseCalledToolFormat(text, markerIndex) {
+  const afterPrefix = markerIndex + CALLED_TOOL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  // Extract tool name until ]
+  const bracketClose = rest.indexOf("]");
+  if (bracketClose === -1) return null;
+
+  const toolName = rest.slice(0, bracketClose).trim();
+  if (!toolName) return null;
+
+  // Find JSON after ]
+  const afterBracket = afterPrefix + bracketClose + 1;
+  const jsonResult = parseJsonFrom(text, text.indexOf("{", afterBracket));
+  if (!jsonResult) return null;
+
+  try {
+    const parsed = JSON.parse(jsonResult.json);
+    return { toolCalls: [makeToolCall(toolName, parsed)], endIndex: jsonResult.endIndex };
+  } catch {
+    return null;
+  }
+}
+
 // Strategy: <tool_code>{"command": "...", "timeout": N}</tool_code>
 function parseToolCodeWrapper(text, markerIndex) {
   const afterPrefix = markerIndex + TOOL_CODE_PREFIX.length;
@@ -632,8 +732,10 @@ const MARKER_STRATEGIES = [
   { prefix: TOOL_CALL_PREFIX, parsers: [parseToolCallWrapper, parseSelfClosingAttr, parseInlineFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
   { prefix: TOOL_CALLS_PREFIX, parsers: [parseToolCallsWrapper] },
   { prefix: TOOL_CODE_PREFIX, parsers: [parseToolCodeWrapper] },
+  { prefix: INVOKE_PREFIX, parsers: [parseInvokeWrapper] },
   { prefix: FUNCTION_CALL_PREFIX, parsers: [parseFunctionCallXml, parseXmlParamFormat] },
   { prefix: PARAMETER_PREFIX, parsers: [parseParameterTags] },
+  { prefix: CALLED_TOOL_PREFIX, parsers: [parseCalledToolFormat] },
   { prefix: AGENT_CALL_PREFIX, parsers: [parseAgentCallFormat] },
 ];
 
@@ -680,7 +782,7 @@ export function extractToolCalls(text) {
   }
 
   // Last resort: try to find standalone JSON objects with "name" + "arguments"
-  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(TOOL_CODE_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
+  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(TOOL_CODE_PREFIX) && !text.includes(INVOKE_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(CALLED_TOOL_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
     JSON_OBJECT_RE.lastIndex = 0;
     let match;
     while ((match = JSON_OBJECT_RE.exec(text)) !== null) {
@@ -745,9 +847,31 @@ export function createToolCallStreamParser(onToolCalls, onText) {
         return;
       }
 
-      // Heuristic: if buffer is long enough and doesn't start with a marker prefix, it's text
+      // Check for bare JSON starting with {"name":
       const bufferTrimmed = buffer.trimStart();
-      if (buffer.length > 60 && !bufferTrimmed.startsWith("<") && !bufferTrimmed.startsWith("`")) {
+      if (bufferTrimmed.startsWith('{"name"')) {
+        // Wait until we have enough to check if it's a valid tool call JSON
+        if (bufferTrimmed.length > 20) {
+          // Try to parse — if it looks like tool call JSON, treat as tool call
+          const testCalls = extractToolCalls(bufferTrimmed);
+          if (testCalls) {
+            // Not enough data yet? Keep buffering if no closing brace found
+            if (!bufferTrimmed.includes("}")) return;
+            decided = true;
+            isToolCall = true;
+            toolCallAccumulator = bufferTrimmed;
+            const leadingWs = buffer.length - bufferTrimmed.length;
+            const before = buffer.slice(0, leadingWs).trim();
+            if (before) onText(before);
+            return;
+          }
+        }
+        // Still buffering potential JSON — don't decide yet if short
+        if (bufferTrimmed.length <= 60) return;
+      }
+
+      // Heuristic: if buffer is long enough and doesn't start with a marker prefix, it's text
+      if (buffer.length > 60 && !bufferTrimmed.startsWith("<") && !bufferTrimmed.startsWith("`") && !bufferTrimmed.startsWith("{")) {
         decided = true;
         isToolCall = false;
         onText(buffer);

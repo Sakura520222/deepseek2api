@@ -6,7 +6,15 @@ const CHAT_MODELS = Object.freeze([
   Object.freeze({ id: "deepseek-chat-expert", modelType: "expert", searchEnabled: false, thinkingEnabled: false }),
   Object.freeze({ id: "deepseek-chat-expert-search", modelType: "expert", searchEnabled: true, thinkingEnabled: false }),
   Object.freeze({ id: "deepseek-reasoner-expert", modelType: "expert", searchEnabled: false, thinkingEnabled: true }),
-  Object.freeze({ id: "deepseek-reasoner-expert-search", modelType: "expert", searchEnabled: true, thinkingEnabled: true })
+  Object.freeze({ id: "deepseek-reasoner-expert-search", modelType: "expert", searchEnabled: true, thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-v4-flash", modelType: "default", searchEnabled: false, thinkingEnabled: false }),
+  Object.freeze({ id: "deepseek-v4-flash-search", modelType: "default", searchEnabled: true, thinkingEnabled: false }),
+  Object.freeze({ id: "deepseek-v4-reasoner-flash", modelType: "default", searchEnabled: false, thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-v4-reasoner-flash-search", modelType: "default", searchEnabled: true, thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-v4-pro", modelType: "expert", searchEnabled: false, thinkingEnabled: false }),
+  Object.freeze({ id: "deepseek-v4-pro-search", modelType: "expert", searchEnabled: true, thinkingEnabled: false }),
+  Object.freeze({ id: "deepseek-v4-reasoner-pro", modelType: "expert", searchEnabled: false, thinkingEnabled: true }),
+  Object.freeze({ id: "deepseek-v4-reasoner-pro-search", modelType: "expert", searchEnabled: true, thinkingEnabled: true })
 ]);
 
 const CHAT_MODEL_MAP = Object.freeze(

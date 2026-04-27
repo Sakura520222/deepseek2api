@@ -2,7 +2,8 @@ import { createServer } from "node:http";
 
 import { config } from "./config.js";
 import { handleApiRequest } from "./routes/api-routes.js";
-import { handleOpenAiRequest, handleProxyRequest } from "./routes/proxy-routes.js";
+import { handleV1Request } from "./routes/v1-routes.js";
+import { handleProxyRequest } from "./routes/proxy-routes.js";
 import { parseCookies, sendError, serveStaticFile } from "./utils/http.js";
 
 const server = createServer(async (request, response) => {
@@ -10,7 +11,7 @@ const server = createServer(async (request, response) => {
   request.cookies = parseCookies(request);
 
   response.setHeader("access-control-allow-origin", "*");
-  response.setHeader("access-control-allow-headers", "content-type, authorization, x-proxy-account-id");
+  response.setHeader("access-control-allow-headers", "content-type, authorization, x-api-key, x-proxy-account-id");
   response.setHeader("access-control-allow-methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS");
 
   if (request.method === "OPTIONS") {
@@ -34,9 +35,9 @@ const server = createServer(async (request, response) => {
     }
 
     if (url.pathname.startsWith("/v1/")) {
-      const handled = await handleOpenAiRequest(request, response, url);
+      const handled = await handleV1Request(request, response, url);
       if (!handled) {
-        sendError(response, 404, "OpenAI route not found");
+        sendError(response, 404, "API route not found");
       }
       return;
     }

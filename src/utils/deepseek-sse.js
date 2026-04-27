@@ -99,6 +99,19 @@ function extractFragmentText(payload) {
     return payload.v;
   }
 
+  // Fallback: try to extract text from common deepseek payload patterns
+  // v4/expert models may use different fragment paths
+  if (typeof payload.v === "string" && payload.v.length > 0) {
+    return payload.v;
+  }
+
+  // Try nested content patterns: v.content, v.text, v.delta, etc.
+  if (payload.v && typeof payload.v === "object") {
+    if (typeof payload.v.content === "string") return payload.v.content;
+    if (typeof payload.v.text === "string") return payload.v.text;
+    if (typeof payload.v.delta === "string") return payload.v.delta;
+  }
+
   return "";
 }
 
@@ -107,9 +120,24 @@ export function createDeepseekDeltaDecoder() {
 
   return {
     consume(payloadText) {
-      const payload = JSON.parse(payloadText);
+      let payload;
+      try {
+        payload = JSON.parse(payloadText);
+      } catch {
+        return null;
+      }
       currentKind = resolveCurrentKind(payload, currentKind);
       const text = extractFragmentText(payload);
+
+      if (!text && process.env.DEBUG_TOOL_CALL) {
+        const hasFragment = payload.v?.response?.fragments || payload.p === "response/fragments" || payload.p === "response/fragments/-1/content";
+        if (!hasFragment && payload.p !== undefined) {
+          console.log("[sse-debug] unmatched payload:", JSON.stringify(payload).slice(0, 200));
+        }
+      }
+
+      if (text === "FINISHED") return null;
+
       return text ? { kind: currentKind, text } : null;
     }
   };

@@ -75,7 +75,15 @@ function parseInlineFormat(text, markerIndex) {
   if (eqIndex >= text.length || text[eqIndex] !== "=") return null;
 
   const jsonResult = parseJsonFrom(text, eqIndex + 1);
-  if (!jsonResult) return null;
+  if (!jsonResult) {
+    // Loose: <tool_call={"name": "Bash"> — incomplete JSON with just a name
+    const looseMatch = text.slice(eqIndex + 1).match(/^\s*\{\s*"name"\s*:\s*"([^"]+)"\s*>/);
+    if (looseMatch) {
+      const gtEnd = text.indexOf(">", eqIndex);
+      return { toolCalls: [makeToolCall(looseMatch[1], {})], endIndex: gtEnd !== -1 ? gtEnd + 1 : text.length };
+    }
+    return null;
+  }
 
   try {
     const parsed = JSON.parse(jsonResult.json);
@@ -169,15 +177,43 @@ function parseAttrFormat(text, markerIndex) {
   const gtIndex = text.indexOf(">", afterAttr);
   if (gtIndex === -1) return null;
 
-  const jsonResult = parseJsonFrom(text, gtIndex + 1);
-  if (!jsonResult) return null;
+  const bodyStart = gtIndex + 1;
 
-  try {
-    const parsed = JSON.parse(jsonResult.json);
-    return { toolCalls: [makeToolCall(nameMatch[1], parsed)], endIndex: jsonResult.endIndex };
-  } catch {
-    return null;
+  // Try JSON body
+  const jsonResult = parseJsonFrom(text, bodyStart);
+  if (jsonResult) {
+    try {
+      const parsed = JSON.parse(jsonResult.json);
+      return { toolCalls: [makeToolCall(nameMatch[1], parsed)], endIndex: jsonResult.endIndex };
+    } catch { /* not JSON */ }
   }
+
+  // Try extracting inner self-closing tags: <tool_call name="cmd" value="..." ... />
+  const closeTag = "</tool_call";
+  const closeIdx = text.indexOf(closeTag, bodyStart);
+  const body = closeIdx !== -1 ? text.slice(bodyStart, closeIdx) : text.slice(bodyStart);
+  const endGt = closeIdx !== -1 ? text.indexOf(">", closeIdx) + 1 : bodyStart + body.length;
+
+  const selfCloseRe = /<tool_call\s+([\s\S]*?)\/>/g;
+  const toolCalls = [];
+  let m;
+  while ((m = selfCloseRe.exec(body)) !== null) {
+    const attrs = {};
+    const attrRe = /(\w+)\s*=\s*"([^"]*)"/g;
+    let am;
+    while ((am = attrRe.exec(m[1])) !== null) attrs[am[1]] = am[2];
+    if (Object.keys(attrs).length > 0) {
+      const args = {};
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k !== "name") args[k] = v;
+      }
+      toolCalls.push(makeToolCall(nameMatch[1], args));
+    }
+  }
+
+  if (toolCalls.length > 0) return { toolCalls, endIndex: endGt };
+
+  return null;
 }
 
 // Strategy 3: <tool_call name="..." arguments={...}>  (Codex inline-attr format)
@@ -452,6 +488,10 @@ function parseSelfClosingAttr(text, markerIndex) {
   const closeIdx = attrText.indexOf("/>");
   if (closeIdx === -1) return null;
 
+  // Reject if there's a > before /> (means this is an opening tag, not self-closing)
+  const gtBeforeClose = attrText.indexOf(">");
+  if (gtBeforeClose !== -1 && gtBeforeClose < closeIdx) return null;
+
   // Determine tool name - prefer "name" attr, fall back to first attr or "shell"
   const name = attrs.name || Object.keys(attrs)[0] || "shell";
 
@@ -696,34 +736,38 @@ function parseParameterTags(text, markerIndex) {
   if (!first) return null;
 
   const toolName = first.attrs.tool || first.attrs.tool_name;
-  if (!toolName) return null;
 
   const args = { [first.attrs.name || "input"]: first.value };
   let scanPos = first.endIndex;
 
-  // Aggregate consecutive <parameter> tags for the same tool
+  // Aggregate consecutive <parameter> tags
   // Only aggregate if they are separated by single newlines (no blank lines between)
   while (scanPos < text.length) {
-    // Collect whitespace between current pos and next <parameter>
     let gapStart = scanPos;
     while (scanPos < text.length && /\s/.test(text[scanPos])) scanPos++;
 
-    // If there's a blank line (double newline) in the gap, stop aggregating
     const gap = text.slice(gapStart, scanPos);
     if (gap.includes("\n\n") || gap.includes("\r\n\r\n")) break;
 
     const next = parseOneParam(scanPos);
     if (!next) break;
 
-    const nextTool = next.attrs.tool || next.attrs.tool_name;
-    if (nextTool !== toolName) break;
+    // If both have tool attrs, they must match; otherwise keep aggregating
+    if (toolName) {
+      const nextTool = next.attrs.tool || next.attrs.tool_name;
+      if (nextTool && nextTool !== toolName) break;
+    }
 
     const nextName = next.attrs.name || "input";
     args[nextName] = next.value;
     scanPos = next.endIndex;
   }
 
-  return { toolCalls: [makeToolCall(toolName, args)], endIndex: scanPos };
+  // Resolve tool name: explicit attr > inferred from args
+  const resolved = toolName || inferToolName(args);
+  if (!resolved) return null;
+
+  return { toolCalls: [makeToolCall(resolved, args)], endIndex: scanPos };
 }
 
 // --- Marker-based strategies dispatcher ---
@@ -808,6 +852,10 @@ export function createToolCallStreamParser(onToolCalls, onText) {
   let decided = false;
   let isToolCall = false;
   let toolCallAccumulator = "";
+  let textAccumulator = "";
+
+  // Marker prefixes that can appear mid-text
+  const MID_TEXT_MARKERS = [TOOL_CALL_PREFIX, TOOL_CALLS_PREFIX, TOOL_CODE_PREFIX, INVOKE_PREFIX, FUNCTION_CALL_PREFIX, PARAMETER_PREFIX, CALLED_TOOL_PREFIX, AGENT_CALL_PREFIX];
 
   return {
     push(text) {
@@ -817,7 +865,38 @@ export function createToolCallStreamParser(onToolCalls, onText) {
         if (isToolCall) {
           toolCallAccumulator += text;
         } else {
-          onText(text);
+          // Even after deciding text, check for markers mid-stream
+          textAccumulator += text;
+          for (const prefix of MID_TEXT_MARKERS) {
+            const idx = textAccumulator.lastIndexOf(prefix);
+            if (idx !== -1) {
+              // Output text before marker, then switch to tool call
+              const before = textAccumulator.slice(0, idx);
+              if (before) onText(before);
+              decided = true;
+              isToolCall = true;
+              toolCallAccumulator = textAccumulator.slice(idx);
+              textAccumulator = "";
+              return;
+            }
+          }
+          // Check for bare JSON
+          const jsonMatch = textAccumulator.match(/\n\s*\{"name"/);
+          if (jsonMatch) {
+            const idx = textAccumulator.indexOf(jsonMatch[0]);
+            const before = textAccumulator.slice(0, idx);
+            if (before) onText(before);
+            decided = true;
+            isToolCall = true;
+            toolCallAccumulator = textAccumulator.slice(idx).trimStart();
+            textAccumulator = "";
+            return;
+          }
+          // No marker — flush accumulated text periodically
+          if (textAccumulator.length > 200) {
+            onText(textAccumulator);
+            textAccumulator = "";
+          }
         }
         return;
       }
@@ -850,12 +929,9 @@ export function createToolCallStreamParser(onToolCalls, onText) {
       // Check for bare JSON starting with {"name":
       const bufferTrimmed = buffer.trimStart();
       if (bufferTrimmed.startsWith('{"name"')) {
-        // Wait until we have enough to check if it's a valid tool call JSON
         if (bufferTrimmed.length > 20) {
-          // Try to parse — if it looks like tool call JSON, treat as tool call
           const testCalls = extractToolCalls(bufferTrimmed);
           if (testCalls) {
-            // Not enough data yet? Keep buffering if no closing brace found
             if (!bufferTrimmed.includes("}")) return;
             decided = true;
             isToolCall = true;
@@ -866,21 +942,30 @@ export function createToolCallStreamParser(onToolCalls, onText) {
             return;
           }
         }
-        // Still buffering potential JSON — don't decide yet if short
         if (bufferTrimmed.length <= 60) return;
       }
 
-      // Heuristic: if buffer is long enough and doesn't start with a marker prefix, it's text
-      if (buffer.length > 60 && !bufferTrimmed.startsWith("<") && !bufferTrimmed.startsWith("`") && !bufferTrimmed.startsWith("{")) {
+      // Heuristic: if buffer is long enough and doesn't contain any marker, start as text
+      if (buffer.length > 60) {
+        const startsLikeMarker = bufferTrimmed.startsWith("<") || bufferTrimmed.startsWith("`") || bufferTrimmed.startsWith("{");
+        if (startsLikeMarker) return;
+
         decided = true;
         isToolCall = false;
-        onText(buffer);
+        textAccumulator = buffer;
         buffer = "";
+        // Don't flush yet — keep in textAccumulator for mid-text marker detection
         return;
       }
     },
 
     flush() {
+      // Flush any accumulated text
+      if (textAccumulator) {
+        onText(textAccumulator);
+        textAccumulator = "";
+      }
+
       if (!decided && buffer) {
         decided = true;
         const toolCalls = extractToolCalls(buffer);

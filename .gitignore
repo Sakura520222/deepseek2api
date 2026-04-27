@@ -4,6 +4,7 @@ node_modules/
 .playwright-mcp/
 data/app.json
 data/*.log
+logs/
 release/
 Thumbs.db
 .claude/

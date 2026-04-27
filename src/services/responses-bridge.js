@@ -115,15 +115,6 @@ function resolveResponsesRequest(body) {
   const resolvedModel = resolveOpenAiModel(body.model);
   const model = tools?.length ? resolveToolCallModel(resolvedModel) : resolvedModel;
 
-  if (process.env.DEBUG_TOOL_CALL) {
-    console.log("[responses-bridge] model:", body.model, "-> resolved:", resolvedModel.id,
-      "| tools:", tools?.length, "| toolChoice:", toolChoice,
-      "| input type:", Array.isArray(input) ? "array" : typeof input,
-      "| input length:", Array.isArray(input) ? input.length : (typeof input === "string" ? input.length : 0),
-      "| toolPrompt:", toolPrompt ? `${toolPrompt.length} chars` : "null");
-    console.log("[responses-bridge] prompt:\n", buildPromptFromMessages(messages, null));
-  }
-
   return {
     model,
     prompt: buildPromptFromMessages(messages, null),
@@ -178,18 +169,19 @@ function buildResponsesOutput(toolCalls, content, reasoningContent) {
   return output;
 }
 
-export async function collectResponsesResult({ account, body, deleteAfterFinish }) {
+export async function collectResponsesResult({ account, body, deleteAfterFinish, debugCtx }) {
   const requestOptions = resolveResponsesRequest(body);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response } = await startCompletion({ account, requestOptions, sessionId });
-      const { content, reasoningContent } = await collectTaggedContent(response.body);
+      const { response } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
+      const { content, reasoningContent } = await collectTaggedContent(response.body, debugCtx);
 
-      const rawToolCalls = extractToolCalls(content);
+      const rawToolCalls = extractToolCalls(content, debugCtx);
       const toolCalls = requestOptions.tools
         ? filterToolCalls(rawToolCalls, requestOptions.tools)
         : rawToolCalls;
@@ -271,18 +263,19 @@ function emitMessageDone(writeSSE, state, text, outIdx) {
   });
 }
 
-export async function streamResponsesResult({ response, account, body, deleteAfterFinish }) {
+export async function streamResponsesResult({ response, account, body, deleteAfterFinish, debugCtx }) {
   const responseId = `resp_${randomUUID()}`;
   const requestOptions = resolveResponsesRequest(body);
   const modelId = requestOptions.model.id;
   const created = Math.floor(Date.now() / 1000);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId });
+      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
 
       response.writeHead(200, {
         "cache-control": "no-cache, no-transform",
@@ -355,6 +348,12 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         state.textAccumulator += text;
         const markerIndex = checkForToolCallMarker(state.textAccumulator);
         if (markerIndex !== -1) {
+          debugCtx?.logToolDetection({
+            markerFound: true,
+            markerIndex,
+            textBeforeMarker: state.textAccumulator.slice(0, markerIndex).slice(-100),
+            markerPrefix: state.textAccumulator.slice(markerIndex, markerIndex + 30)
+          });
           state.toolCallDetected = true;
           state.toolCallBuffer = state.textAccumulator.slice(markerIndex);
           const before = state.textAccumulator.slice(0, markerIndex);
@@ -383,10 +382,9 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           state.decidedAsText = true;
           emitTextChunk(toStream);
         }
-      });
+      }, debugCtx);
 
       if (state.textAccumulator && !state.toolCallDetected) {
-        // Even after streaming text, check remaining buffer for tool calls
         if (state.decidedAsText) {
           const markerIdx = checkForToolCallMarker(state.textAccumulator);
           if (markerIdx !== -1) {
@@ -407,9 +405,15 @@ export async function streamResponsesResult({ response, account, body, deleteAft
       emitMessageDone(writeSSE, state, state.emittedText, textOutputBaseIdx());
 
       if (state.toolCallDetected) {
-        const rawToolCalls = extractToolCalls(state.toolCallBuffer);
+        const rawToolCalls = extractToolCalls(state.toolCallBuffer, debugCtx);
         const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
         state.toolCalls = toolCalls;
+        debugCtx?.logToolDetection({
+          toolCallBufferLength: state.toolCallBuffer.length,
+          rawToolCallCount: rawToolCalls?.length ?? 0,
+          filteredToolCallCount: toolCalls?.length ?? 0,
+          toolCalls: toolCalls?.map(tc => ({ name: tc.function.name, id: tc.id })) ?? []
+        });
         if (toolCalls) {
           let fcIdx = textOutputBaseIdx() + (state.messageItemId ? 1 : 0);
           for (const tc of toolCalls) {
@@ -435,6 +439,8 @@ export async function streamResponsesResult({ response, account, body, deleteAft
           emitMessageDone(writeSSE, state, state.toolCallBuffer, textOutputBaseIdx());
         }
       }
+
+      debugCtx?.logFinalResponse({ toolCalls: state.toolCalls?.map(tc => ({ name: tc.function.name })) ?? null });
 
       const output = [];
       if (state.reasoningAccumulator) {

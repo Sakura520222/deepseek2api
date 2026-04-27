@@ -155,18 +155,19 @@ function formatAnthropicContent(toolCalls, content, reasoningContent) {
   return contentBlocks;
 }
 
-export async function collectAnthropicMessage({ account, body, deleteAfterFinish }) {
+export async function collectAnthropicMessage({ account, body, deleteAfterFinish, debugCtx }) {
   const requestOptions = resolveAnthropicRequest(body);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response } = await startCompletion({ account, requestOptions, sessionId });
-      const { content, reasoningContent } = await collectTaggedContent(response.body);
+      const { response } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
+      const { content, reasoningContent } = await collectTaggedContent(response.body, debugCtx);
 
-      const rawToolCalls = extractToolCalls(content);
+      const rawToolCalls = extractToolCalls(content, debugCtx);
       const toolCalls = requestOptions.tools
         ? filterToolCalls(rawToolCalls, requestOptions.tools)
         : rawToolCalls;
@@ -191,17 +192,18 @@ function writeSSE(response, eventType, data) {
   response.write(`event: ${eventType}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-export async function streamAnthropicMessage({ response, account, body, deleteAfterFinish }) {
+export async function streamAnthropicMessage({ response, account, body, deleteAfterFinish, debugCtx }) {
   const messageId = `msg_${randomUUID()}`;
   const requestOptions = resolveAnthropicRequest(body);
   const modelName = requestOptions.modelName;
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId });
+      const { response: dsResponse } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
 
       response.writeHead(200, {
         "cache-control": "no-cache, no-transform",
@@ -300,6 +302,12 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
         textAccumulator += text;
         const markerIndex = checkForToolCallMarker(textAccumulator);
         if (markerIndex !== -1) {
+          debugCtx?.logToolDetection({
+            markerFound: true,
+            markerIndex,
+            textBeforeMarker: textAccumulator.slice(0, markerIndex).slice(-100),
+            markerPrefix: textAccumulator.slice(markerIndex, markerIndex + 30)
+          });
           toolCallDetected = true;
           toolCallBuffer = textAccumulator.slice(markerIndex);
           const before = textAccumulator.slice(0, markerIndex);
@@ -341,10 +349,9 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
             delta: { type: "text_delta", text: toStream }
           });
         }
-      });
+      }, debugCtx);
 
       if (textAccumulator && !toolCallDetected) {
-        // Even after streaming text, check if remaining buffer contains a tool call
         if (decidedAsText) {
           const markerIdx = checkForToolCallMarker(textAccumulator);
           if (markerIdx !== -1) {
@@ -376,8 +383,14 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
       closeTextBlock();
 
       if (toolCallDetected) {
-        const rawToolCalls = extractToolCalls(toolCallBuffer);
+        const rawToolCalls = extractToolCalls(toolCallBuffer, debugCtx);
         const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
+        debugCtx?.logToolDetection({
+          toolCallBufferLength: toolCallBuffer.length,
+          rawToolCallCount: rawToolCalls?.length ?? 0,
+          filteredToolCallCount: toolCalls?.length ?? 0,
+          toolCalls: toolCalls?.map(tc => ({ name: tc.function.name, id: tc.id })) ?? []
+        });
         if (toolCalls) {
           hasToolCalls = true;
           for (const tc of toolCalls) {
@@ -409,6 +422,8 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
           closeTextBlock();
         }
       }
+
+      debugCtx?.logFinalResponse({ stop_reason: hasToolCalls ? "tool_use" : "end_turn" });
 
       writeSSE(response, "message_delta", {
         type: "message_delta",

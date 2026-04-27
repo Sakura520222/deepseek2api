@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import { getApiKeyRecord } from "../services/api-key-service.js";
 import { takeRoundRobinAccount } from "../services/account-rotation-service.js";
 import { collectAnthropicMessage, streamAnthropicMessage } from "../services/anthropic-bridge.js";
@@ -6,6 +8,7 @@ import { collectOpenAiResponse, streamOpenAiResponse } from "../services/openai-
 import { listOpenAiModels } from "../services/openai-request.js";
 import { collectResponsesResult, streamResponsesResult } from "../services/responses-bridge.js";
 import { withOwnerRequestLimit } from "../services/request-limit-service.js";
+import { createRequestDebugContext } from "../utils/debug-logger.js";
 import { parseJsonBody, readRequestBody, sendError, sendJson } from "../utils/http.js";
 
 function getBearerToken(request) {
@@ -47,21 +50,35 @@ function handleApiError(response, error) {
   return false;
 }
 
-async function withApiRequest(request, response, apiKeyRecord, { streamHandler, collectHandler }) {
-  const body = parseJsonBody(await readRequestBody(request));
-  const account = takeRoundRobinAccount(apiKeyRecord);
-  if (!account) {
-    sendError(response, 404, "Account not found");
-    return;
-  }
+async function withApiRequest(request, response, apiKeyRecord, { streamHandler, collectHandler }, bridgeName) {
+  const requestId = `req_${randomUUID().replace(/-/g, "").slice(0, 12)}`;
+  const debugCtx = createRequestDebugContext(requestId, bridgeName);
 
-  const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
+  try {
+    const body = parseJsonBody(await readRequestBody(request));
+    debugCtx?.logIncoming(request.headers, body);
 
-  if (body.stream) {
-    await streamHandler({ response, account, body, deleteAfterFinish });
-  } else {
-    const payload = await collectHandler({ account, body, deleteAfterFinish });
-    sendJson(response, 200, payload);
+    const account = takeRoundRobinAccount(apiKeyRecord);
+    if (!account) {
+      sendError(response, 404, "Account not found");
+      return;
+    }
+
+    debugCtx?.logResolved(null, account, !!(body?.tools?.length));
+    const deleteAfterFinish = isIncognitoEnabledForOwner(apiKeyRecord.ownerId);
+
+    if (body.stream) {
+      await streamHandler({ response, account, body, deleteAfterFinish, debugCtx });
+    } else {
+      const payload = await collectHandler({ account, body, deleteAfterFinish, debugCtx });
+      debugCtx?.logFinalResponse(payload);
+      sendJson(response, 200, payload);
+    }
+  } catch (error) {
+    debugCtx?.logError(error);
+    throw error;
+  } finally {
+    debugCtx?.flush();
   }
 }
 
@@ -93,7 +110,7 @@ export async function handleV1Request(request, response, url) {
         await withApiRequest(request, response, apiKeyRecord, {
           streamHandler: streamOpenAiResponse,
           collectHandler: collectOpenAiResponse
-        });
+        }, "openai");
       });
     } catch (error) {
       if (!handleApiError(response, error)) throw error;
@@ -112,7 +129,7 @@ export async function handleV1Request(request, response, url) {
         await withApiRequest(request, response, apiKeyRecord, {
           streamHandler: streamResponsesResult,
           collectHandler: collectResponsesResult
-        });
+        }, "responses");
       });
     } catch (error) {
       if (!handleApiError(response, error)) throw error;
@@ -131,7 +148,7 @@ export async function handleV1Request(request, response, url) {
         await withApiRequest(request, response, apiKeyRecord, {
           streamHandler: streamAnthropicMessage,
           collectHandler: collectAnthropicMessage
-        });
+        }, "anthropic");
       });
     } catch (error) {
       if (!handleApiError(response, error)) throw error;

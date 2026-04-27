@@ -13,10 +13,6 @@ const JSON_OBJECT_RE = /\{[\s\n]*"name"\s*:\s*"[^"]+?"[\s\S]*?"arguments"\s*:\s*
 
 const DEBUG = !!process.env.DEBUG_TOOL_CALL;
 
-function debugLog(...args) {
-  if (DEBUG) console.log("[tool-call]", ...args);
-}
-
 // --- JSON helpers ---
 
 function parseJsonFrom(text, startIndex) {
@@ -798,13 +794,21 @@ const MARKER_STRATEGIES = [
 
 // --- Main extraction ---
 
-export function extractToolCalls(text) {
+export function extractToolCalls(text, debugCtx = null) {
   if (!text) return null;
+
+  const strategies = [];
 
   // Try code block format first (independent of markers)
   const codeBlockResult = parseCodeBlocks(text);
   if (codeBlockResult) {
-    debugLog("extracted via code block strategy:", codeBlockResult.toolCalls.length, "calls");
+    debugCtx?.logToolParsing({
+      inputLength: text.length,
+      strategiesTried: ["parseCodeBlocks"],
+      successStrategy: "parseCodeBlocks",
+      rawResultCount: codeBlockResult.toolCalls.length,
+      rawResults: codeBlockResult.toolCalls.map(tc => ({ name: tc.function.name }))
+    });
     return codeBlockResult.toolCalls;
   }
 
@@ -815,17 +819,20 @@ export function extractToolCalls(text) {
   while (searchStart < text.length) {
     let bestResult = null;
     let bestPos = text.length;
+    let matchedStrategy = null;
 
-    // Find the nearest marker across all strategy prefixes
     for (const { prefix, parsers } of MARKER_STRATEGIES) {
       const idx = text.indexOf(prefix, searchStart);
       if (idx !== -1 && idx < bestPos) {
         for (const parser of parsers) {
+          const parserName = parser.name;
+          strategies.push(parserName);
           const result = parser(text, idx);
           if (result) {
             if (idx < bestPos) {
               bestPos = idx;
               bestResult = result;
+              matchedStrategy = `${prefix}:${parserName}`;
             }
             break;
           }
@@ -836,10 +843,18 @@ export function extractToolCalls(text) {
     if (!bestResult) break;
     toolCalls.push(...bestResult.toolCalls);
     searchStart = bestResult.endIndex;
+    debugCtx?.logToolParsing({
+      inputLength: text.length,
+      strategiesTried: strategies.slice(-10),
+      successStrategy: matchedStrategy,
+      rawResultCount: toolCalls.length,
+      rawResults: toolCalls.map(tc => ({ name: tc.function.name, argLength: tc.function.arguments.length }))
+    });
   }
 
   // Last resort: try to find standalone JSON objects with "name" + "arguments"
   if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(TOOL_CODE_PREFIX) && !text.includes(INVOKE_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(CALLED_TOOL_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
+    strategies.push("standaloneJSON");
     JSON_OBJECT_RE.lastIndex = 0;
     let match;
     while ((match = JSON_OBJECT_RE.exec(text)) !== null) {
@@ -852,9 +867,14 @@ export function extractToolCalls(text) {
     }
   }
 
-  if (toolCalls.length > 0) {
-    debugLog("extracted", toolCalls.length, "tool calls from", text.length, "chars");
-  }
+  debugCtx?.logToolParsing({
+    inputLength: text.length,
+    strategiesTried: strategies.length > 0 ? [...new Set(strategies)] : ["none"],
+    successStrategy: toolCalls.length > 0 ? strategies[strategies.length - 1] : null,
+    rawResultCount: toolCalls.length,
+    rawResults: toolCalls.map(tc => ({ name: tc.function.name, argLength: tc.function.arguments.length }))
+  });
+
   return toolCalls.length > 0 ? toolCalls : null;
 }
 

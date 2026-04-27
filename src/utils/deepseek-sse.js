@@ -129,13 +129,6 @@ export function createDeepseekDeltaDecoder() {
       currentKind = resolveCurrentKind(payload, currentKind);
       const text = extractFragmentText(payload);
 
-      if (!text && process.env.DEBUG_TOOL_CALL) {
-        const hasFragment = payload.v?.response?.fragments || payload.p === "response/fragments" || payload.p === "response/fragments/-1/content";
-        if (!hasFragment && payload.p !== undefined) {
-          console.log("[sse-debug] unmatched payload:", JSON.stringify(payload).slice(0, 200));
-        }
-      }
-
       if (text === "FINISHED") return null;
 
       return text ? { kind: currentKind, text } : null;

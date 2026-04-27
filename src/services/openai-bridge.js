@@ -89,18 +89,19 @@ function buildChunkPayload(completionId, model, delta, finishReason) {
   };
 }
 
-export async function collectOpenAiResponse({ account, body, deleteAfterFinish = false }) {
+export async function collectOpenAiResponse({ account, body, deleteAfterFinish = false, debugCtx }) {
   const requestOptions = resolveCompletionRequest(body);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
     body,
     deleteAfterFinish,
     onComplete: async (sessionId) => {
-      const { response } = await startCompletion({ account, requestOptions, sessionId });
-      const { content, reasoningContent } = await collectTaggedContent(response.body);
+      const { response } = await startCompletion({ account, requestOptions, sessionId, debugCtx });
+      const { content, reasoningContent } = await collectTaggedContent(response.body, debugCtx);
 
-      const rawToolCalls = extractToolCalls(content);
+      const rawToolCalls = extractToolCalls(content, debugCtx);
       const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
 
       if (toolCalls) {
@@ -161,9 +162,10 @@ function buildToolCallChunkPayload(completionId, model, toolCalls, finishReason)
 }
 
 export async function streamOpenAiResponse(options) {
-  const { account, body, deleteAfterFinish = false, response } = options;
+  const { account, body, deleteAfterFinish = false, response, debugCtx } = options;
   const completionId = `chatcmpl_${randomUUID()}`;
   const requestOptions = resolveCompletionRequest(body);
+  debugCtx?.logResolved(requestOptions.model, account, !!requestOptions.tools);
 
   return withCompletionSession({
     account,
@@ -173,7 +175,8 @@ export async function streamOpenAiResponse(options) {
       const { response: deepseekResponse } = await startCompletion({
         account,
         requestOptions,
-        sessionId
+        sessionId,
+        debugCtx
       });
 
       response.writeHead(200, {
@@ -198,10 +201,8 @@ export async function streamOpenAiResponse(options) {
       let decidedAsText = false;
 
       function checkForToolCallMarker(buf) {
-        // Check known markers
         const idx = findToolCallMarker(buf);
         if (idx !== -1) return idx;
-        // Check bare JSON: {"name":
         const jsonIdx = buf.indexOf('{"name"');
         if (jsonIdx !== -1) return jsonIdx;
         return -1;
@@ -211,6 +212,12 @@ export async function streamOpenAiResponse(options) {
         const markerIdx = checkForToolCallMarker(textBuffer);
         if (markerIdx !== -1) {
           const before = textBuffer.slice(0, markerIdx);
+          debugCtx?.logToolDetection({
+            markerFound: true,
+            markerIndex: markerIdx,
+            textBeforeMarker: before.slice(-100),
+            markerPrefix: textBuffer.slice(markerIdx, markerIdx + 30)
+          });
           if (before) {
             response.write(
               `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
@@ -241,10 +248,8 @@ export async function streamOpenAiResponse(options) {
 
         textBuffer += text;
 
-        // Check for tool call markers
         if (trySwitchToToolCall()) return;
 
-        // Partial marker check — hold back tail that might be start of a marker
         let safeEnd = textBuffer.length;
         if (isPartialMarker(textBuffer)) {
           for (let i = Math.max(0, textBuffer.length - 20); i < textBuffer.length; i++) {
@@ -269,14 +274,12 @@ export async function streamOpenAiResponse(options) {
             `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toStream }))}\n\n`
           );
         }
-      });
+      }, debugCtx);
 
-      // Final check: even if decided as text, scan for markers in remaining buffer
       if (textBuffer && !toolCallDetected) {
         if (!decidedAsText || checkForToolCallMarker(textBuffer) !== -1) {
-          // Not yet decided, or found a marker — try tool call extraction
           if (!decidedAsText) {
-            const rawToolCalls = extractToolCalls(textBuffer);
+            const rawToolCalls = extractToolCalls(textBuffer, debugCtx);
             if (rawToolCalls) {
               toolCallDetected = true;
               toolCallBuffer = textBuffer;
@@ -296,8 +299,15 @@ export async function streamOpenAiResponse(options) {
       }
 
       if (toolCallDetected) {
-        const rawToolCalls = extractToolCalls(toolCallBuffer);
+        const rawToolCalls = extractToolCalls(toolCallBuffer, debugCtx);
         const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
+        debugCtx?.logToolDetection({
+          toolCallBufferLength: toolCallBuffer.length,
+          rawToolCallCount: rawToolCalls?.length ?? 0,
+          filteredToolCallCount: toolCalls?.length ?? 0,
+          toolCalls: toolCalls?.map(tc => ({ name: tc.function.name, id: tc.id })) ?? []
+        });
+        debugCtx?.logFinalResponse({ finishReason: toolCalls ? "tool_calls" : "stop" });
         if (toolCalls) {
           response.write(
             `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
@@ -314,6 +324,7 @@ export async function streamOpenAiResponse(options) {
           );
         }
       } else {
+        debugCtx?.logFinalResponse({ finishReason: "stop" });
         response.write(
           `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
         );

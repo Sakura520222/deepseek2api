@@ -53,37 +53,43 @@ export function filterToolCalls(toolCalls, tools) {
   return filtered.length > 0 ? filtered : null;
 }
 
-export async function startCompletion({ account, requestOptions, sessionId }) {
+export async function startCompletion({ account, requestOptions, sessionId, debugCtx }) {
+  const body = Buffer.from(
+    JSON.stringify({
+      chat_session_id: sessionId,
+      parent_message_id: null,
+      model_type: requestOptions.model.modelType,
+      prompt: requestOptions.prompt,
+      ref_file_ids: [],
+      thinking_enabled: requestOptions.model.thinkingEnabled,
+      search_enabled: requestOptions.model.searchEnabled,
+      preempt: false
+    })
+  );
+
+  debugCtx?.logUpstream(body);
+
   return proxyDeepseekRequest({
     account,
     method: "POST",
     path: "/api/v0/chat/completion",
-    body: Buffer.from(
-      JSON.stringify({
-        chat_session_id: sessionId,
-        parent_message_id: null,
-        model_type: requestOptions.model.modelType,
-        prompt: requestOptions.prompt,
-        ref_file_ids: [],
-        thinking_enabled: requestOptions.model.thinkingEnabled,
-        search_enabled: requestOptions.model.searchEnabled,
-        preempt: false
-      })
-    ),
+    body,
     headers: { "content-type": "application/json" }
   });
 }
 
-export async function consumeTaggedStream(stream, onTagged) {
+export async function consumeTaggedStream(stream, onTagged, debugCtx = null) {
   if (!stream) {
     return;
   }
 
   const decoder = new TextDecoder();
   const deltaDecoder = createDeepseekDeltaDecoder();
-  const parser = createSseParser(({ data }) => {
+  const parser = createSseParser(({ event, data }) => {
+    debugCtx?.logSseFrame({ event, data: data.length > 2000 ? data.slice(0, 2000) + `... (${data.length} chars)` : data });
     const delta = deltaDecoder.consume(data);
     if (delta?.text) {
+      debugCtx?.logDelta(delta.kind, delta.text);
       onTagged({ kind: delta.kind, text: delta.text });
     }
   });
@@ -94,7 +100,7 @@ export async function consumeTaggedStream(stream, onTagged) {
   parser.flush();
 }
 
-export async function collectTaggedContent(stream) {
+export async function collectTaggedContent(stream, debugCtx = null) {
   let content = "";
   let reasoningContent = "";
 
@@ -104,7 +110,7 @@ export async function collectTaggedContent(stream) {
     } else {
       content += tagged.text;
     }
-  });
+  }, debugCtx);
 
   return { content, reasoningContent };
 }

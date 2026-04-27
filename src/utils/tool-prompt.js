@@ -11,8 +11,6 @@ const PARAMETER_PREFIX = "<parameter";
 const CODE_BLOCK_RE = /```(?:tool_call|json)\s*\n?([\s\S]*?)```/g;
 const JSON_OBJECT_RE = /\{[\s\n]*"name"\s*:\s*"[^"]+?"[\s\S]*?"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g;
 
-const DEBUG = !!process.env.DEBUG_TOOL_CALL;
-
 // --- JSON helpers ---
 
 function parseJsonFrom(text, startIndex) {
@@ -42,7 +40,6 @@ function parseJsonFrom(text, startIndex) {
     const closed = text.slice(startIndex) + "}".repeat(depth);
     try {
       JSON.parse(closed);
-      debugLog("auto-closed truncated JSON, original depth:", depth);
       return { json: closed, endIndex: text.length };
     } catch {
       return null;
@@ -683,7 +680,9 @@ function parseCalledToolFormat(text, markerIndex) {
 
   // Find JSON after ]
   const afterBracket = afterPrefix + bracketClose + 1;
-  const jsonResult = parseJsonFrom(text, text.indexOf("{", afterBracket));
+  const jsonStart = text.indexOf("{", afterBracket);
+  if (jsonStart === -1) return null;
+  const jsonResult = parseJsonFrom(text, jsonStart);
   if (!jsonResult) return null;
 
   try {
@@ -877,7 +876,7 @@ export function extractToolCalls(text, debugCtx = null) {
   }
 
   // Last resort: try to find standalone JSON objects with "name" + "arguments"
-  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(TOOL_CODE_PREFIX) && !text.includes(INVOKE_PREFIX) && !text.includes(PARAMETER_PREFIX) && !text.includes(CALLED_TOOL_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
+  if (toolCalls.length === 0 && !MARKER_STRATEGIES.some(({ prefix }) => text.includes(prefix))) {
     strategies.push("standaloneJSON");
     JSON_OBJECT_RE.lastIndex = 0;
     let match;

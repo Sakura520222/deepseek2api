@@ -19,6 +19,14 @@ export function findToolCallMarker(text) {
   return earliest;
 }
 
+export function checkForToolCallMarker(buf) {
+  const idx = findToolCallMarker(buf);
+  if (idx !== -1) return idx;
+  const jsonIdx = buf.indexOf('{"name"');
+  if (jsonIdx !== -1) return jsonIdx;
+  return -1;
+}
+
 export function isPartialMarker(text) {
   for (const marker of TOOL_CALL_MARKERS) {
     for (let i = Math.max(0, text.length - marker.length); i < text.length; i++) {

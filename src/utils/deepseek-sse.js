@@ -99,13 +99,7 @@ function extractFragmentText(payload) {
     return payload.v;
   }
 
-  // Fallback: try to extract text from common deepseek payload patterns
-  // v4/expert models may use different fragment paths
-  if (typeof payload.v === "string" && payload.v.length > 0) {
-    return payload.v;
-  }
-
-  // Try nested content patterns: v.content, v.text, v.delta, etc.
+  // Nested content patterns for v4/expert models: v.content, v.text, v.delta
   if (payload.v && typeof payload.v === "object") {
     if (typeof payload.v.content === "string") return payload.v.content;
     if (typeof payload.v.text === "string") return payload.v.text;
@@ -129,7 +123,12 @@ export function createDeepseekDeltaDecoder() {
       currentKind = resolveCurrentKind(payload, currentKind);
       const text = extractFragmentText(payload);
 
-      if (text === "FINISHED") return null;
+      // DeepSeek signal frame: bare "FINISHED" string in a payload without fragment structure.
+      // Only filter when the payload is clearly a termination signal (no fragment-related keys),
+      // so that normal text responses containing "FINISHED" are not swallowed.
+      if (text === "FINISHED" && !("p" in payload) && !payload.v?.response?.fragments) {
+        return null;
+      }
 
       return text ? { kind: currentKind, text } : null;
     }

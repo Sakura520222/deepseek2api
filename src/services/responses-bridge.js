@@ -3,10 +3,10 @@ import { randomUUID } from "node:crypto";
 import { buildPromptFromMessages } from "../utils/prompt.js";
 import { buildToolSystemPrompt, extractToolCalls } from "../utils/tool-prompt.js";
 import {
+  checkForToolCallMarker,
   collectTaggedContent,
   consumeTaggedStream,
   filterToolCalls,
-  findToolCallMarker,
   isPartialMarker,
   startCompletion,
   TOOL_CALL_MARKERS,
@@ -307,14 +307,6 @@ export async function streamResponsesResult({ response, account, body, deleteAft
         toolCalls: null,
         decidedAsText: false
       };
-
-      function checkForToolCallMarker(buf) {
-        const idx = findToolCallMarker(buf);
-        if (idx !== -1) return idx;
-        const jsonIdx = buf.indexOf('{"name"');
-        if (jsonIdx !== -1) return jsonIdx;
-        return -1;
-      }
 
       const textOutputBaseIdx = () => state.reasoningItemId ? 1 : 0;
 

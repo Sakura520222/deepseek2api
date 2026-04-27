@@ -78,7 +78,8 @@ export function createRequestDebugContext(requestId, bridge) {
     },
 
     logUpstream(body) {
-      upstream = typeof body === "string" ? body : body ? body.toString("utf8") : null;
+      const raw = typeof body === "string" ? body : body ? body.toString("utf8") : null;
+      upstream = raw;
     },
 
     logSseFrame(data) {
@@ -116,7 +117,8 @@ export function createRequestDebugContext(requestId, bridge) {
       const dateStr = now.toISOString().slice(0, 10);
       const timeStr = now.toTimeString().slice(0, 8).replace(/:/g, "");
 
-      const dateDir = join(process.cwd(), "logs", "debug", dateStr);
+      const logRoot = process.env.DEBUG_LOG_DIR || join(process.cwd(), "logs", "debug");
+      const dateDir = join(logRoot, dateStr);
       const reqDir = join(dateDir, `${timeStr}_${bridge}_${requestId}`);
       mkdirSync(reqDir, { recursive: true });
 
@@ -124,7 +126,10 @@ export function createRequestDebugContext(requestId, bridge) {
         writeJson(reqDir, "meta.json", meta);
         if (incoming) writeJson(reqDir, "incoming.json", incoming);
         if (resolved) writeJson(reqDir, "resolved.json", resolved);
-        if (upstream) writeJson(reqDir, "upstream.json", { body: upstream });
+        if (upstream) writeJson(reqDir, "upstream.json", {
+          bodyLength: upstream.length,
+          bodyPreview: upstream.length > 2000 ? upstream.slice(0, 2000) + "..." : upstream
+        });
         if (sseFrames.length) writeJsonl(reqDir, "sse-frames.jsonl", sseFrames);
         if (deltas.length) writeJsonl(reqDir, "deltas.jsonl", deltas);
         if (toolDetection) writeJson(reqDir, "tool-detection.json", toolDetection);

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 const TOOL_CALL_PREFIX = "<tool_call";
 const FUNCTION_CALL_PREFIX = "<function_call";
+const AGENT_CALL_PREFIX = "[调用 Agent]";
 const CODE_BLOCK_RE = /```(?:tool_call|json)\s*\n?([\s\S]*?)```/g;
 const JSON_OBJECT_RE = /\{[\s\n]*"name"\s*:\s*"[^"]+?"[\s\S]*?"arguments"\s*:\s*\{[\s\S]*?\}\s*\}/g;
 
@@ -103,12 +104,36 @@ function parseAttrFormat(text, markerIndex) {
   }
 }
 
-// Strategy 3: <tool_call {"name": ...}> (loose: space instead of =)
+// Strategy 3: <tool_call name="..." arguments={...}>  (Codex inline-attr format)
+function parseInlineAttrFormat(text, markerIndex) {
+  const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  const attrMatch = rest.match(/^\s+name\s*=\s*"([^"]+)"\s+arguments\s*=\s*/);
+  if (!attrMatch) return null;
+
+  const jsonStart = afterPrefix + attrMatch[0].length;
+  const jsonResult = parseJsonFrom(text, jsonStart);
+  if (!jsonResult) return null;
+
+  const afterJson = text.slice(jsonResult.endIndex).trimStart();
+  if (afterJson.length > 0 && afterJson[0] !== ">") return null;
+
+  try {
+    const parsed = JSON.parse(jsonResult.json);
+    return { toolCalls: [makeToolCall(attrMatch[1], parsed)], endIndex: jsonResult.endIndex };
+  } catch { return null; }
+}
+
+// Strategy 4: <tool_call JSON> (loose: whitespace then JSON)
 function parseLooseInline(text, markerIndex) {
   const afterPrefix = markerIndex + TOOL_CALL_PREFIX.length;
-  if (afterPrefix >= text.length || text[afterPrefix] !== " ") return null;
+  const rest = text.slice(afterPrefix);
 
-  const jsonStart = afterPrefix + 1;
+  const wsMatch = rest.match(/^\s+/);
+  if (!wsMatch) return null;
+
+  const jsonStart = afterPrefix + wsMatch[0].length;
   const jsonResult = parseJsonFrom(text, jsonStart);
   if (!jsonResult) return null;
 
@@ -230,11 +255,31 @@ function parseXmlParamFormat(text, markerIndex) {
   return { toolCalls: [makeToolCall(nameMatch[1], {})], endIndex: end };
 }
 
+// Strategy: [调用 Agent] {"description":"...", "subagent_type":"...", "prompt":"..."}
+function parseAgentCallFormat(text, markerIndex) {
+  const afterPrefix = markerIndex + AGENT_CALL_PREFIX.length;
+  const rest = text.slice(afterPrefix);
+
+  const jsonStartMatch = rest.match(/^\s*/);
+  const jsonStart = afterPrefix + jsonStartMatch[0].length;
+
+  const jsonResult = parseJsonFrom(text, jsonStart);
+  if (!jsonResult) return null;
+
+  try {
+    const parsed = JSON.parse(jsonResult.json);
+    const name = parsed.description || parsed.subagent_type || "agent";
+    const { description, ...args } = parsed;
+    return { toolCalls: [makeToolCall(name, args)], endIndex: jsonResult.endIndex };
+  } catch { return null; }
+}
+
 // --- Marker-based strategies dispatcher ---
 
 const MARKER_STRATEGIES = [
-  { prefix: TOOL_CALL_PREFIX, parsers: [parseInlineFormat, parseAttrFormat, parseLooseInline, parseXmlParamFormat] },
+  { prefix: TOOL_CALL_PREFIX, parsers: [parseInlineFormat, parseAttrFormat, parseInlineAttrFormat, parseLooseInline, parseXmlParamFormat] },
   { prefix: FUNCTION_CALL_PREFIX, parsers: [parseFunctionCallXml, parseXmlParamFormat] },
+  { prefix: AGENT_CALL_PREFIX, parsers: [parseAgentCallFormat] },
 ];
 
 // --- Main extraction ---
@@ -280,7 +325,7 @@ export function extractToolCalls(text) {
   }
 
   // Last resort: try to find standalone JSON objects with "name" + "arguments"
-  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX)) {
+  if (toolCalls.length === 0 && !text.includes(TOOL_CALL_PREFIX) && !text.includes(FUNCTION_CALL_PREFIX) && !text.includes(AGENT_CALL_PREFIX)) {
     JSON_OBJECT_RE.lastIndex = 0;
     let match;
     while ((match = JSON_OBJECT_RE.exec(text)) !== null) {

@@ -10,6 +10,7 @@ import {
   isPartialMarker,
   startCompletion,
   TOOL_CALL_MARKERS,
+  MARKER_START_CHARS,
   withCompletionSession
 } from "./completion-core.js";
 import { assertNoLegacySearchOptions, resolveOpenAiModel, resolveToolCallModel } from "./openai-request.js";
@@ -99,7 +100,8 @@ export async function collectOpenAiResponse({ account, body, deleteAfterFinish =
       const { response } = await startCompletion({ account, requestOptions, sessionId });
       const { content, reasoningContent } = await collectTaggedContent(response.body);
 
-      const toolCalls = requestOptions.tools ? filterToolCalls(extractToolCalls(content), requestOptions.tools) : null;
+      const rawToolCalls = extractToolCalls(content);
+      const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
 
       if (toolCalls) {
         const message = {
@@ -190,108 +192,90 @@ export async function streamOpenAiResponse(options) {
         ))}\n\n`
       );
 
-      if (requestOptions.tools) {
-        let toolCallDetected = false;
-        let toolCallBuffer = "";
-        let textBuffer = "";
+      let toolCallDetected = false;
+      let toolCallBuffer = "";
+      let textBuffer = "";
 
-        await consumeTaggedStream(deepseekResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            response.write(
-              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { reasoning_content: tagged.text }))}\n\n`
-            );
-            return;
-          }
-
-          const text = tagged.text;
-
-          if (toolCallDetected) {
-            toolCallBuffer += text;
-            return;
-          }
-
-          textBuffer += text;
-
-          const markerIndex = findToolCallMarker(textBuffer);
-          if (markerIndex !== -1) {
-            toolCallDetected = true;
-            const before = textBuffer.slice(0, markerIndex);
-            if (before) {
-              response.write(
-                `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
-              );
-            }
-            toolCallBuffer = textBuffer.slice(markerIndex);
-            textBuffer = "";
-            return;
-          }
-
-          let safeEnd = textBuffer.length;
-          if (isPartialMarker(textBuffer)) {
-            for (let i = Math.max(0, textBuffer.length - 20); i < textBuffer.length; i++) {
-              if (textBuffer[i] !== "<" && textBuffer[i] !== "`") continue;
-              const tail = textBuffer.slice(i);
-              let isPartial = false;
-              for (const marker of TOOL_CALL_MARKERS) {
-                if (marker.startsWith(tail)) { isPartial = true; break; }
-              }
-              if (tail.startsWith("```")) { isPartial = true; }
-              if (isPartial) { safeEnd = i; break; }
-            }
-          }
-
-          const toStream = textBuffer.slice(0, safeEnd);
-          textBuffer = textBuffer.slice(safeEnd);
-
-          if (toStream) {
-            response.write(
-              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toStream }))}\n\n`
-            );
-          }
-        });
-
-        if (textBuffer && !toolCallDetected) {
+      await consumeTaggedStream(deepseekResponse.body, (tagged) => {
+        if (tagged.kind === "thinking") {
           response.write(
-            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: textBuffer }))}\n\n`
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { reasoning_content: tagged.text }))}\n\n`
           );
+          return;
         }
 
+        const text = tagged.text;
+
         if (toolCallDetected) {
-          const toolCalls = filterToolCalls(extractToolCalls(toolCallBuffer), requestOptions.tools);
-          if (toolCalls) {
+          toolCallBuffer += text;
+          return;
+        }
+
+        textBuffer += text;
+
+        const markerIndex = findToolCallMarker(textBuffer);
+        if (markerIndex !== -1) {
+          toolCallDetected = true;
+          const before = textBuffer.slice(0, markerIndex);
+          if (before) {
             response.write(
-              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
-            );
-            response.write(
-              `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
-            );
-          } else {
-            response.write(
-              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toolCallBuffer }))}\n\n`
-            );
-            response.write(
-              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
+              `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: before }))}\n\n`
             );
           }
+          toolCallBuffer = textBuffer.slice(markerIndex);
+          textBuffer = "";
+          return;
+        }
+
+        let safeEnd = textBuffer.length;
+        if (isPartialMarker(textBuffer)) {
+          for (let i = Math.max(0, textBuffer.length - 20); i < textBuffer.length; i++) {
+            if (!MARKER_START_CHARS.includes(textBuffer[i])) continue;
+            const tail = textBuffer.slice(i);
+            let isPartial = false;
+            for (const marker of TOOL_CALL_MARKERS) {
+              if (marker.startsWith(tail)) { isPartial = true; break; }
+            }
+            if (tail.startsWith("```")) { isPartial = true; }
+            if (isPartial) { safeEnd = i; break; }
+          }
+        }
+
+        const toStream = textBuffer.slice(0, safeEnd);
+        textBuffer = textBuffer.slice(safeEnd);
+
+        if (toStream) {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toStream }))}\n\n`
+          );
+        }
+      });
+
+      if (textBuffer && !toolCallDetected) {
+        response.write(
+          `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: textBuffer }))}\n\n`
+        );
+      }
+
+      if (toolCallDetected) {
+        const rawToolCalls = extractToolCalls(toolCallBuffer);
+        const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
+        if (toolCalls) {
+          response.write(
+            `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, toolCalls))}\n\n`
+          );
+          response.write(
+            `data: ${JSON.stringify(buildToolCallChunkPayload(completionId, requestOptions.model.id, [], "tool_calls"))}\n\n`
+          );
         } else {
+          response.write(
+            `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, { content: toolCallBuffer }))}\n\n`
+          );
           response.write(
             `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
           );
         }
       } else {
-        await consumeTaggedStream(deepseekResponse.body, (tagged) => {
-          const delta = tagged.kind === "thinking"
-            ? { reasoning_content: tagged.text }
-            : { content: tagged.text };
-          response.write(
-            `data: ${JSON.stringify(buildChunkPayload(
-              completionId,
-              requestOptions.model.id,
-              delta
-            ))}\n\n`
-          );
-        });
-
         response.write(
           `data: ${JSON.stringify(buildChunkPayload(completionId, requestOptions.model.id, "", "stop"))}\n\n`
         );

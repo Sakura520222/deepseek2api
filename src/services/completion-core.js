@@ -4,7 +4,9 @@ import { createDeepseekDeltaDecoder, createSseParser } from "../utils/deepseek-s
 import { createChatSession, deleteChatSession } from "./chat-session-service.js";
 import { proxyDeepseekRequest } from "./deepseek-proxy.js";
 
-export const TOOL_CALL_MARKERS = ["<tool_call", "<function_call"];
+export const TOOL_CALL_MARKERS = ["<tool_call", "<function_call", "[调用 Agent]"];
+
+export const MARKER_START_CHARS = [...new Set(["<", "`", ...TOOL_CALL_MARKERS.map(m => m[0])])];
 
 export function findToolCallMarker(text) {
   let earliest = -1;
@@ -20,7 +22,7 @@ export function findToolCallMarker(text) {
 export function isPartialMarker(text) {
   for (const marker of TOOL_CALL_MARKERS) {
     for (let i = Math.max(0, text.length - marker.length); i < text.length; i++) {
-      if (text[i] !== "<") continue;
+      if (!MARKER_START_CHARS.includes(text[i])) continue;
       const tail = text.slice(i);
       if (marker.startsWith(tail)) return true;
     }

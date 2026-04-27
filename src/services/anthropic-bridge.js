@@ -10,6 +10,7 @@ import {
   isPartialMarker,
   startCompletion,
   TOOL_CALL_MARKERS,
+  MARKER_START_CHARS,
   withCompletionSession
 } from "./completion-core.js";
 import { resolveOpenAiModel, resolveToolCallModel } from "./openai-request.js";
@@ -165,9 +166,10 @@ export async function collectAnthropicMessage({ account, body, deleteAfterFinish
       const { response } = await startCompletion({ account, requestOptions, sessionId });
       const { content, reasoningContent } = await collectTaggedContent(response.body);
 
+      const rawToolCalls = extractToolCalls(content);
       const toolCalls = requestOptions.tools
-        ? filterToolCalls(extractToolCalls(content), requestOptions.tools)
-        : null;
+        ? filterToolCalls(rawToolCalls, requestOptions.tools)
+        : rawToolCalls;
 
       const contentBlocks = formatAnthropicContent(toolCalls, content, reasoningContent);
 
@@ -266,144 +268,116 @@ export async function streamAnthropicMessage({ response, account, body, deleteAf
         blockIndex++;
       }
 
-      if (requestOptions.tools) {
-        await consumeTaggedStream(dsResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            startThinkingBlock();
-            writeSSE(response, "content_block_delta", {
-              type: "content_block_delta",
-              index: blockIndex,
-              delta: { type: "thinking_delta", thinking: tagged.text }
-            });
-            return;
-          }
-
-          const text = tagged.text;
-          if (reasoningBlockOpen) {
-            closeThinkingBlock();
-          }
-          if (toolCallDetected) {
-            toolCallBuffer += text;
-            return;
-          }
-
-          textAccumulator += text;
-          const markerIndex = findToolCallMarker(textAccumulator);
-          if (markerIndex !== -1) {
-            toolCallDetected = true;
-            toolCallBuffer = textAccumulator.slice(markerIndex);
-            const before = textAccumulator.slice(0, markerIndex);
-            textAccumulator = "";
-            if (before) {
-              startTextBlock();
-              writeSSE(response, "content_block_delta", {
-                type: "content_block_delta",
-                index: blockIndex,
-                delta: { type: "text_delta", text: before }
-              });
-            }
-            return;
-          }
-
-          let safeEnd = textAccumulator.length;
-          if (isPartialMarker(textAccumulator)) {
-            for (let i = Math.max(0, textAccumulator.length - 20); i < textAccumulator.length; i++) {
-              if (textAccumulator[i] !== "<" && textAccumulator[i] !== "`") continue;
-              const tail = textAccumulator.slice(i);
-              let isPartial = false;
-              for (const marker of TOOL_CALL_MARKERS) {
-                if (marker.startsWith(tail)) { isPartial = true; break; }
-              }
-              if (tail.startsWith("```")) { isPartial = true; }
-              if (isPartial) { safeEnd = i; break; }
-            }
-          }
-          const toStream = textAccumulator.slice(0, safeEnd);
-          textAccumulator = textAccumulator.slice(safeEnd);
-
-          if (toStream) {
-            startTextBlock();
-            writeSSE(response, "content_block_delta", {
-              type: "content_block_delta",
-              index: blockIndex,
-              delta: { type: "text_delta", text: toStream }
-            });
-          }
-        });
-
-        if (textAccumulator && !toolCallDetected) {
-          startTextBlock();
+      await consumeTaggedStream(dsResponse.body, (tagged) => {
+        if (tagged.kind === "thinking") {
+          startThinkingBlock();
           writeSSE(response, "content_block_delta", {
             type: "content_block_delta",
             index: blockIndex,
-            delta: { type: "text_delta", text: textAccumulator }
+            delta: { type: "thinking_delta", thinking: tagged.text }
           });
-          textAccumulator = "";
+          return;
         }
 
-        closeThinkingBlock();
-        closeTextBlock();
-
+        const text = tagged.text;
+        if (reasoningBlockOpen) {
+          closeThinkingBlock();
+        }
         if (toolCallDetected) {
-          const toolCalls = filterToolCalls(extractToolCalls(toolCallBuffer), requestOptions.tools);
-          if (toolCalls) {
-            hasToolCalls = true;
-            for (const tc of toolCalls) {
-              let input;
-              try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+          toolCallBuffer += text;
+          return;
+        }
 
-              writeSSE(response, "content_block_start", {
-                type: "content_block_start",
-                index: blockIndex,
-                content_block: { type: "tool_use", id: tc.id, name: tc.function.name, input: {} }
-              });
-              writeSSE(response, "content_block_delta", {
-                type: "content_block_delta",
-                index: blockIndex,
-                delta: { type: "input_json_delta", partial_json: tc.function.arguments }
-              });
-              writeSSE(response, "content_block_stop", {
-                type: "content_block_stop", index: blockIndex
-              });
-              blockIndex++;
-            }
-          } else {
+        textAccumulator += text;
+        const markerIndex = findToolCallMarker(textAccumulator);
+        if (markerIndex !== -1) {
+          toolCallDetected = true;
+          toolCallBuffer = textAccumulator.slice(markerIndex);
+          const before = textAccumulator.slice(0, markerIndex);
+          textAccumulator = "";
+          if (before) {
             startTextBlock();
             writeSSE(response, "content_block_delta", {
               type: "content_block_delta",
               index: blockIndex,
-              delta: { type: "text_delta", text: toolCallBuffer }
+              delta: { type: "text_delta", text: before }
             });
-            closeTextBlock();
+          }
+          return;
+        }
+
+        let safeEnd = textAccumulator.length;
+        if (isPartialMarker(textAccumulator)) {
+          for (let i = Math.max(0, textAccumulator.length - 20); i < textAccumulator.length; i++) {
+            if (!MARKER_START_CHARS.includes(textAccumulator[i])) continue;
+            const tail = textAccumulator.slice(i);
+            let isPartial = false;
+            for (const marker of TOOL_CALL_MARKERS) {
+              if (marker.startsWith(tail)) { isPartial = true; break; }
+            }
+            if (tail.startsWith("```")) { isPartial = true; }
+            if (isPartial) { safeEnd = i; break; }
           }
         }
-      } else {
-        await consumeTaggedStream(dsResponse.body, (tagged) => {
-          if (tagged.kind === "thinking") {
-            startThinkingBlock();
-            writeSSE(response, "content_block_delta", {
-              type: "content_block_delta",
-              index: blockIndex,
-              delta: { type: "thinking_delta", thinking: tagged.text }
-            });
-            return;
-          }
+        const toStream = textAccumulator.slice(0, safeEnd);
+        textAccumulator = textAccumulator.slice(safeEnd);
 
-          if (reasoningBlockOpen) {
-            closeThinkingBlock();
-          }
-
+        if (toStream) {
           startTextBlock();
           writeSSE(response, "content_block_delta", {
             type: "content_block_delta",
             index: blockIndex,
-            delta: { type: "text_delta", text: tagged.text }
+            delta: { type: "text_delta", text: toStream }
           });
-          textAccumulator += tagged.text;
-        });
+        }
+      });
 
-        closeThinkingBlock();
-        closeTextBlock();
+      if (textAccumulator && !toolCallDetected) {
+        startTextBlock();
+        writeSSE(response, "content_block_delta", {
+          type: "content_block_delta",
+          index: blockIndex,
+          delta: { type: "text_delta", text: textAccumulator }
+        });
+        textAccumulator = "";
+      }
+
+      closeThinkingBlock();
+      closeTextBlock();
+
+      if (toolCallDetected) {
+        const rawToolCalls = extractToolCalls(toolCallBuffer);
+        const toolCalls = requestOptions.tools ? filterToolCalls(rawToolCalls, requestOptions.tools) : rawToolCalls;
+        if (toolCalls) {
+          hasToolCalls = true;
+          for (const tc of toolCalls) {
+            let input;
+            try { input = JSON.parse(tc.function.arguments); } catch { input = {}; }
+
+            writeSSE(response, "content_block_start", {
+              type: "content_block_start",
+              index: blockIndex,
+              content_block: { type: "tool_use", id: tc.id, name: tc.function.name, input: {} }
+            });
+            writeSSE(response, "content_block_delta", {
+              type: "content_block_delta",
+              index: blockIndex,
+              delta: { type: "input_json_delta", partial_json: tc.function.arguments }
+            });
+            writeSSE(response, "content_block_stop", {
+              type: "content_block_stop", index: blockIndex
+            });
+            blockIndex++;
+          }
+        } else {
+          startTextBlock();
+          writeSSE(response, "content_block_delta", {
+            type: "content_block_delta",
+            index: blockIndex,
+            delta: { type: "text_delta", text: toolCallBuffer }
+          });
+          closeTextBlock();
+        }
       }
 
       writeSSE(response, "message_delta", {

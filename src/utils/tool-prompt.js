@@ -616,7 +616,20 @@ function parseInvokeWrapper(text, markerIndex) {
     args[m[1]] = m[2].trim();
   }
 
-  if (Object.keys(args).length === 0) return null;
+  if (Object.keys(args).length === 0) {
+    // Try <tool_call_name>name</tool_call_name> + <tool_call_args>{...}</tool_call_args>
+    const nameMatch = content.match(/<tool_call_name>([\s\S]*?)<\/tool_call_name>/);
+    const argsMatch = content.match(/<tool_call_args>([\s\S]*?)<\/tool_call_args>/);
+    if (nameMatch) {
+      const toolName = nameMatch[1].trim();
+      let toolArgs = {};
+      if (argsMatch) {
+        try { toolArgs = JSON.parse(argsMatch[1].trim()); } catch { toolArgs = { raw: argsMatch[1].trim() }; }
+      }
+      return { toolCalls: [makeToolCall(toolName, toolArgs)], endIndex: closeIdx + closeTag.length };
+    }
+    return null;
+  }
 
   // Determine tool name: from invoke attribute, or infer from parameters
   const toolName = invokeAttrTool
